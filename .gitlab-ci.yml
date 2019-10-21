@@ -1,0 +1,75 @@
+image: "rust:latest"
+
+stages:
+  - check
+  - test
+  - fmt
+
+variables:
+  RUST_VERSION: stable
+  RUST_TARGET: x86_64-unknown-linux-gnu
+
+cache:
+  key: "$CI_PIPELINE_ID-$RUST_VERSION"
+  paths:
+    - target/
+
+before_script:
+  - |
+    rustup install $RUST_VERSION
+    rustup default $RUST_VERSION
+  - |
+    rustc --version
+    cargo --version
+    which cargo
+    which rustc
+
+.check-base: &check-base
+  stage: check
+  script:
+    - cargo check --all --verbose
+check-stable:
+  <<: *check-base
+check-beta:
+  <<: *check-base
+  variables:
+    RUST_VERSION: beta
+check-nightly:
+  <<: *check-base
+  variables:
+    RUST_VERSION: nightly
+
+.test-base: &test-base
+  stage: test
+  script:
+    - cargo test --all --verbose
+test-stable:
+  <<: *test-base
+  variables:
+    RUSTUP_TOOLCHAIN: stable
+test-beta:
+  <<: *test-base
+  variables:
+    RUSTUP_TOOLCHAIN: beta
+test-nightly:
+  <<: *test-base
+  variables:
+    RUSTUP_TOOLCHAIN: nightly
+
+.fmt-base: &fmt-base
+  stage: fmt
+  script:
+    - cargo fmt --all --verbose -- --check
+fmt-nightly:
+  <<: *fmt-base
+  variables:
+    RUSTUP_TOOLCHAIN: nightly
+
+.clippy-base: &clippy-base
+  stage: fmt
+  script:
+    - cargo clippy --all --verbose -- -D warnings
+clippy-nightly:
+  <<: *clippy-base
+  variables:
+    RUSTUP_TOOLCHAIN: nightly

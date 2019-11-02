@@ -1,3 +1,6 @@
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![allow(clippy::cast_precision_loss)]
 //! This is a library for exploring regret minimization
 //! with rust. Specifically this is mostly about poker.
 use ndarray::prelude::*;
@@ -30,30 +33,33 @@ impl RegretMatcher {
     fn rand_weights(num_experts: usize) -> Vec<f64> {
         vec![1.0 / num_experts as f64; num_experts]
     }
-    pub fn new(num_experts: usize) -> RegretMatcher {
+    #[must_use]
+    pub fn new(num_experts: usize) -> Self {
         // Every expert starts out with a weight.
         // Those weights all add to 1.0f
-        let p = RegretMatcher::rand_weights(num_experts);
-        RegretMatcher::new_from_p(p)
+        let p = Self::rand_weights(num_experts);
+        Self::new_from_p(p)
     }
 
-    pub fn new_from_p(p: Vec<f64>) -> RegretMatcher {
+    #[must_use]
+    pub fn new_from_p(p: Vec<f64>) -> Self {
         // We're going to move p so capture it now
         let num_experts = p.len();
         // Create the distribution. This is a lot of
         // precompute
         let dist = WeightedIndex::new(&p).unwrap();
-        RegretMatcher {
+        Self {
             num_experts,
             p: Array1::from(p),
             sum_p: Array1::zeros(num_experts),
-            cumulative_reward: 0.0f64,
-            expert_reward: Array1::from(vec![0.0f64; num_experts]),
+            cumulative_reward: 0.0_f64,
+            expert_reward: Array1::from(vec![0.0_f64; num_experts]),
             dist,
             num_games: 0,
         }
     }
 
+    #[must_use]
     pub fn next_action(&self) -> usize {
         self.dist.sample(&mut thread_rng())
     }
@@ -74,7 +80,7 @@ impl RegretMatcher {
         let regret_sum = capped_regret.sum();
         if regret_sum <= 0.0 {
             // This shouldn't happen but if it does then don't count the previous tries.
-            self.p = Array1::from(RegretMatcher::rand_weights(self.num_experts));
+            self.p = Array1::from(Self::rand_weights(self.num_experts));
             self.cumulative_reward = 0.0;
             self.expert_reward = Array1::zeros(self.num_experts);
             self.num_games = 0;
@@ -95,6 +101,7 @@ impl RegretMatcher {
         self.dist = WeightedIndex::new(&self.p).unwrap();
     }
 
+    #[must_use]
     pub fn best_weight(&self) -> Vec<f64> {
         (self.sum_p.clone() / self.num_games as f64).to_vec()
     }

@@ -1,14 +1,13 @@
 use crate::regret_matcher::RegretMatcher;
 use lazy_static::*;
 use ndarray::prelude::*;
-use std::cmp;
-use std::mem;
+use num_derive::{FromPrimitive, ToPrimitive};
+use num_traits::FromPrimitive;
 
 use std::vec::Vec;
 
 #[allow(dead_code)]
-#[repr(usize)]
-#[derive(Debug)]
+#[derive(Debug, FromPrimitive, ToPrimitive)]
 enum RPSAction {
     Rock = 0,
     Paper = 1,
@@ -26,17 +25,6 @@ impl RPSAction {
             Self::Rock => ROCK_REWARD.view(),
             Self::Paper => PAPER_REWARD.view(),
             Self::Scissors => SCISSOR_REWARD.view(),
-        }
-    }
-}
-
-impl From<usize> for RPSAction {
-    fn from(i: usize) -> Self {
-        unsafe {
-            mem::transmute(cmp::max(
-                cmp::min(i, Self::Scissors as usize),
-                Self::Rock as usize,
-            ))
         }
     }
 }
@@ -63,8 +51,8 @@ impl RPSRunner {
         }
     }
     pub fn run_one(&mut self) {
-        let a1 = RPSAction::from(self.matcher_one.next_action());
-        let a2 = RPSAction::from(self.matcher_two.next_action());
+        let a1 = RPSAction::from_usize(self.matcher_one.next_action()).unwrap();
+        let a2 = RPSAction::from_usize(self.matcher_two.next_action()).unwrap();
         self.matcher_one.update_regret(a1.to_reward());
         self.matcher_two.update_regret(a2.to_reward())
     }

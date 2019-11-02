@@ -9,6 +9,8 @@ ndarray = "0.13.0"
 rand = "0.7.2"
 rand_distr = "0.2.2"
 lazy_static = "1.4.0"
+num-traits = "0.2"
+num-derive = "0.3"
 
 [dev-dependencies]
 criterion = "0.3"

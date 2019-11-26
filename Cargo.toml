@@ -2,7 +2,14 @@
 name = "little-sorry"
 version = "0.1.0"
 authors = ["Elliott Clark <eclark@apache.org>"]
+keywords = ["cards", "poker", "regret-minimization"]
+categories = ["games"]
+homepage = "https://docs.rs/little_sorry"
+repository = "https://github.com/elliottneilclark/little-sorry"
+description = "Library to help with coding regret minimization."
+license = "Apache-2.0"
 edition = "2018"
+
 
 [dependencies]
 ndarray = "0.13.0"

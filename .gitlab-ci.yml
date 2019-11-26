@@ -59,17 +59,19 @@ test-nightly:
 .fmt-base: &fmt-base
   stage: fmt
   script:
+    - rustup component add rustfmt
     - cargo fmt --all --verbose -- --check
-fmt-nightly:
+fmt-beta:
   <<: *fmt-base
   variables:
-    RUSTUP_TOOLCHAIN: nightly
+    RUSTUP_TOOLCHAIN: beta
 
 .clippy-base: &clippy-base
   stage: fmt
   script:
+    - rustup component add clippy
     - cargo clippy --all --verbose -- -D warnings
-clippy-nightly:
+clippy-beta:
   <<: *clippy-base
   variables:
-    RUSTUP_TOOLCHAIN: nightly
+    RUSTUP_TOOLCHAIN: beta

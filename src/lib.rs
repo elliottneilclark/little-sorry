@@ -1,6 +1,6 @@
 #![deny(clippy::all)]
-#![deny(clippy::pedantic)]
 
+pub mod errors;
 pub mod regret_matcher;
 pub mod rps;
 

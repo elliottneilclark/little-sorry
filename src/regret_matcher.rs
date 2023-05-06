@@ -4,16 +4,14 @@
 use ndarray::prelude::*;
 use rand::distributions::Distribution;
 use rand::thread_rng;
-use rand_distr::weighted::WeightedIndex;
+use rand_distr::WeightedAliasIndex;
 
 use std::vec::Vec;
 
+use crate::errors::LittleError;
+
 #[derive(Debug, Clone)]
 pub struct RegretMatcher {
-    // How many experts we have.
-    // That means this generator can emit an
-    // action of 0..num_experts non inclusive.
-    num_experts: usize,
     // The chance each expert has of being chosen
     p: Array1<f64>,
     sum_p: Array1<f64>,
@@ -22,47 +20,41 @@ pub struct RegretMatcher {
     // The cumulative reward earned
     cumulative_reward: f64,
     // The distribution that generates actions.
-    dist: WeightedIndex<f64>,
-
-    num_games: usize,
+    dist: WeightedAliasIndex<f64>,
+    num_updates: usize,
 }
 
 impl RegretMatcher {
-    fn rand_weights(num_experts: usize) -> Vec<f64> {
+    fn init_weights(num_experts: usize) -> Vec<f64> {
         vec![1.0 / num_experts as f64; num_experts]
     }
-    #[must_use]
-    pub fn new(num_experts: usize) -> Self {
+    pub fn new(num_experts: usize) -> Result<Self, LittleError> {
         // Every expert starts out with a weight.
         // Those weights all add to 1.0f
-        let p = Self::rand_weights(num_experts);
+        let p = Self::init_weights(num_experts);
         Self::new_from_p(p)
     }
-
-    #[must_use]
-    pub fn new_from_p(p: Vec<f64>) -> Self {
+    pub fn new_from_p(p: Vec<f64>) -> Result<Self, LittleError> {
         // We're going to move p so capture it now
         let num_experts = p.len();
         // Create the distribution. This is a lot of
         // precompute
-        let dist = WeightedIndex::new(&p).unwrap();
-        Self {
-            num_experts,
+        let dist = WeightedAliasIndex::new(p.clone())?;
+        Ok(Self {
             p: Array1::from(p),
             sum_p: Array1::zeros(num_experts),
             cumulative_reward: 0.0_f64,
             expert_reward: Array1::from(vec![0.0_f64; num_experts]),
             dist,
-            num_games: 0,
-        }
+            num_updates: 0,
+        })
     }
-
-    #[must_use]
     pub fn next_action(&self) -> usize {
         self.dist.sample(&mut thread_rng())
     }
 
-    pub fn update_regret(&mut self, reward_array: ArrayView1<f64>) {
+    pub fn update_regret(&mut self, reward_array: ArrayView1<f64>) -> Result<(), LittleError> {
+        let num_experts = self.p.len();
         // Compute how much reward we could expect.
         // Any reward for an agent with a very low p will be very low.
         let r = self.p.dot(&reward_array);
@@ -78,10 +70,10 @@ impl RegretMatcher {
         let regret_sum = capped_regret.sum();
         if regret_sum <= 0.0 {
             // This shouldn't happen but if it does then don't count the previous tries.
-            self.p = Array1::from(Self::rand_weights(self.num_experts));
+            self.p = Array1::from(Self::init_weights(num_experts));
             self.cumulative_reward = 0.0;
-            self.expert_reward = Array1::zeros(self.num_experts);
-            self.num_games = 0;
+            self.expert_reward = Array1::zeros(num_experts);
+            self.num_updates = 0;
         } else {
             // The new probablities are the capped
             // regret over the total. This should always
@@ -93,15 +85,16 @@ impl RegretMatcher {
             // swinging wildly for any times that the more
             // than one agent has credibility.
             self.sum_p += &self.p;
-            // Need to keep track of the number of games as well.
-            self.num_games += 1;
+            // Need to keep track of the number of times update_regret has been called.
+            self.num_updates += 1;
         }
-        self.dist = WeightedIndex::new(&self.p).unwrap();
+        self.dist = WeightedAliasIndex::new(self.p.to_vec())?;
+        Ok(())
     }
 
     #[must_use]
     pub fn best_weight(&self) -> Vec<f64> {
-        (self.sum_p.clone() / self.num_games as f64).to_vec()
+        (self.sum_p.clone() / self.num_updates as f64).to_vec()
     }
 }
 
@@ -116,15 +109,13 @@ mod tests {
     #[test]
     fn test_regret_gen_new() {
         let _rg = RegretMatcher::new(3);
-        assert!(true);
     }
 
     #[test]
     fn test_next_action() {
-        let rg = RegretMatcher::new(100);
+        let rg = RegretMatcher::new(100).unwrap();
         for _i in 0..500 {
             let a = rg.next_action();
-            assert!(a >= 0);
             assert!(a < 100);
         }
     }

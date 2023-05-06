@@ -3,12 +3,18 @@
 
 use little_sorry::rps::RPSRunner;
 
+static NUM_ITERS: usize = 100_000_000;
+
 fn main() {
-    let mut runner = RPSRunner::new();
+    let mut runner = RPSRunner::new().unwrap();
     dbg!(&runner.matcher_one);
-    for _i in 0..1_000_000 {
+    for i in 0..NUM_ITERS {
         runner.run_one();
+
+        if i % 50 == 0 || i == NUM_ITERS - 1 {
+            runner.update_regret().unwrap();
+        }
     }
-    dbg!(&runner.matcher_one);
+    dbg!(&runner);
     dbg!(runner.best_weight());
 }

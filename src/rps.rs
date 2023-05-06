@@ -1,6 +1,7 @@
+use crate::errors::LittleError;
 use crate::regret_matcher::RegretMatcher;
-use lazy_static::*;
 use ndarray::prelude::*;
+use once_cell::sync::Lazy;
 use std::cmp;
 use std::mem;
 
@@ -8,20 +9,19 @@ use std::vec::Vec;
 
 #[allow(dead_code)]
 #[repr(usize)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum RPSAction {
     Rock = 0,
     Paper = 1,
     Scissors = 2,
 }
 
-lazy_static! {
-    static ref ROCK_REWARD: Array1<f64> = array![0.0_f64, 1.0_f64, -1.0_f64];
-    static ref PAPER_REWARD: Array1<f64> = array![-1.0_f64, 0.0_f64, 1.0_f64];
-    static ref SCISSOR_REWARD: Array1<f64> = array![1.0_f64, -1.0_f64, 0.0_f64];
-}
+static ROCK_REWARD: Lazy<Array1<f64>> = Lazy::new(|| array![0.0_f64, 1.0_f64, -1.0_f64]);
+static PAPER_REWARD: Lazy<Array1<f64>> = Lazy::new(|| array![-1.0_f64, 0.0_f64, 1.0_f64]);
+static SCISSOR_REWARD: Lazy<Array1<f64>> = Lazy::new(|| array![1.0_f64, -1.0_f64, 0.0_f64]);
+
 impl RPSAction {
-    pub fn to_reward(&self) -> ArrayView1<f64> {
+    pub fn to_reward(self) -> ArrayView1<'static, f64> {
         match self {
             Self::Rock => ROCK_REWARD.view(),
             Self::Paper => PAPER_REWARD.view(),
@@ -45,28 +45,42 @@ impl From<usize> for RPSAction {
 pub struct RPSRunner {
     pub matcher_one: RegretMatcher,
     pub matcher_two: RegretMatcher,
+    pending_reward_one: Array1<f64>,
+    pending_reward_two: Array1<f64>,
 }
 
 impl Default for RPSRunner {
     #[must_use]
     fn default() -> Self {
-        Self::new()
+        Self::new().unwrap()
     }
 }
 
 impl RPSRunner {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            matcher_one: RegretMatcher::new(3),
-            matcher_two: RegretMatcher::new(3),
-        }
+    pub fn new() -> Result<Self, LittleError> {
+        Ok(Self {
+            matcher_one: RegretMatcher::new(3)?,
+            matcher_two: RegretMatcher::new(3)?,
+            pending_reward_one: Array1::zeros(3),
+            pending_reward_two: Array1::zeros(3),
+        })
     }
     pub fn run_one(&mut self) {
         let a1 = RPSAction::from(self.matcher_one.next_action());
         let a2 = RPSAction::from(self.matcher_two.next_action());
-        self.matcher_one.update_regret(a1.to_reward());
-        self.matcher_two.update_regret(a2.to_reward())
+
+        self.pending_reward_one += &a2.to_reward();
+        self.pending_reward_two += &a1.to_reward();
+    }
+    pub fn update_regret(&mut self) -> Result<(), LittleError> {
+        self.matcher_one
+            .update_regret(self.pending_reward_one.view())?;
+        self.matcher_two
+            .update_regret(self.pending_reward_two.view())?;
+
+        self.pending_reward_one.fill(f64::from(0));
+        self.pending_reward_two.fill(f64::from(0));
+        Ok(())
     }
     #[must_use]
     pub fn best_weight(&self) -> Vec<f64> {

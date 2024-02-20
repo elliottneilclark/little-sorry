@@ -13,20 +13,20 @@ use crate::errors::LittleError;
 #[derive(Debug, Clone)]
 pub struct RegretMatcher {
     // The chance each expert has of being chosen
-    p: Array1<f64>,
-    sum_p: Array1<f64>,
+    p: Array1<f32>,
+    sum_p: Array1<f32>,
     // The amount the expert has accumulated
-    expert_reward: Array1<f64>,
+    expert_reward: Array1<f32>,
     // The cumulative reward earned
-    cumulative_reward: f64,
+    cumulative_reward: f32,
     // The distribution that generates actions.
-    dist: WeightedAliasIndex<f64>,
+    dist: WeightedAliasIndex<f32>,
     num_updates: usize,
 }
 
 impl RegretMatcher {
-    fn init_weights(num_experts: usize) -> Vec<f64> {
-        vec![1.0 / num_experts as f64; num_experts]
+    fn init_weights(num_experts: usize) -> Vec<f32> {
+        vec![1.0 / num_experts as f32; num_experts]
     }
     pub fn new(num_experts: usize) -> Result<Self, LittleError> {
         // Every expert starts out with a weight.
@@ -34,7 +34,7 @@ impl RegretMatcher {
         let p = Self::init_weights(num_experts);
         Self::new_from_p(p)
     }
-    pub fn new_from_p(p: Vec<f64>) -> Result<Self, LittleError> {
+    pub fn new_from_p(p: Vec<f32>) -> Result<Self, LittleError> {
         // We're going to move p so capture it now
         let num_experts = p.len();
         // Create the distribution. This is a lot of
@@ -43,8 +43,8 @@ impl RegretMatcher {
         Ok(Self {
             p: Array1::from(p),
             sum_p: Array1::zeros(num_experts),
-            cumulative_reward: 0.0_f64,
-            expert_reward: Array1::from(vec![0.0_f64; num_experts]),
+            cumulative_reward: 0.0_f32,
+            expert_reward: Array1::from(vec![0.0_f32; num_experts]),
             dist,
             num_updates: 0,
         })
@@ -53,7 +53,7 @@ impl RegretMatcher {
         self.dist.sample(&mut thread_rng())
     }
 
-    pub fn update_regret(&mut self, reward_array: ArrayView1<f64>) -> Result<(), LittleError> {
+    pub fn update_regret(&mut self, reward_array: ArrayView1<f32>) -> Result<(), LittleError> {
         let num_experts = self.p.len();
         // Compute how much reward we could expect.
         // Any reward for an agent with a very low p will be very low.
@@ -66,7 +66,7 @@ impl RegretMatcher {
         let regret = &self.expert_reward - self.cumulative_reward;
         // Any regret that's negative is performing much worse than the
         // current suggestion. So just don't try and use it.
-        let capped_regret: Array1<f64> = regret.iter().map(|v: &f64| f64::max(0.0, *v)).collect();
+        let capped_regret: Array1<f32> = regret.iter().map(|v: &f32| f32::max(0.0, *v)).collect();
         let regret_sum = capped_regret.sum();
         if regret_sum <= 0.0 {
             // This shouldn't happen but if it does then don't count the previous tries.
@@ -93,8 +93,8 @@ impl RegretMatcher {
     }
 
     #[must_use]
-    pub fn best_weight(&self) -> Vec<f64> {
-        (self.sum_p.clone() / self.num_updates as f64).to_vec()
+    pub fn best_weight(&self) -> Vec<f32> {
+        (self.sum_p.clone() / self.num_updates as f32).to_vec()
     }
 }
 

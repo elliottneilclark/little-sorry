@@ -16,12 +16,12 @@ enum RPSAction {
     Scissors = 2,
 }
 
-static ROCK_REWARD: Lazy<Array1<f64>> = Lazy::new(|| array![0.0_f64, 1.0_f64, -1.0_f64]);
-static PAPER_REWARD: Lazy<Array1<f64>> = Lazy::new(|| array![-1.0_f64, 0.0_f64, 1.0_f64]);
-static SCISSOR_REWARD: Lazy<Array1<f64>> = Lazy::new(|| array![1.0_f64, -1.0_f64, 0.0_f64]);
+static ROCK_REWARD: Lazy<Array1<f32>> = Lazy::new(|| array![0.0_f32, 1.0_f32, -1.0_f32]);
+static PAPER_REWARD: Lazy<Array1<f32>> = Lazy::new(|| array![-1.0_f32, 0.0_f32, 1.0_f32]);
+static SCISSOR_REWARD: Lazy<Array1<f32>> = Lazy::new(|| array![1.0_f32, -1.0_f32, 0.0_f32]);
 
 impl RPSAction {
-    pub fn to_reward(self) -> ArrayView1<'static, f64> {
+    pub fn to_reward(self) -> ArrayView1<'static, f32> {
         match self {
             Self::Rock => ROCK_REWARD.view(),
             Self::Paper => PAPER_REWARD.view(),
@@ -45,8 +45,8 @@ impl From<usize> for RPSAction {
 pub struct RPSRunner {
     pub matcher_one: RegretMatcher,
     pub matcher_two: RegretMatcher,
-    pending_reward_one: Array1<f64>,
-    pending_reward_two: Array1<f64>,
+    pending_reward_one: Array1<f32>,
+    pending_reward_two: Array1<f32>,
 }
 
 impl Default for RPSRunner {
@@ -78,12 +78,12 @@ impl RPSRunner {
         self.matcher_two
             .update_regret(self.pending_reward_two.view())?;
 
-        self.pending_reward_one.fill(f64::from(0));
-        self.pending_reward_two.fill(f64::from(0));
+        self.pending_reward_one.fill(0.0);
+        self.pending_reward_two.fill(0.0);
         Ok(())
     }
     #[must_use]
-    pub fn best_weight(&self) -> Vec<f64> {
+    pub fn best_weight(&self) -> Vec<f32> {
         self.matcher_one.best_weight()
     }
 }

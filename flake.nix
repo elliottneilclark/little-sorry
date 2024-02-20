@@ -8,7 +8,6 @@
     crane = {
       url = "github:ipetkov/crane";
       inputs.nixpkgs.follows = "nixpkgs";
-      inputs.flake-utils.follows = "flake-utils";
     };
 
     fenix = {
@@ -30,6 +29,7 @@
         overlays = [ fenix.overlays.default ];
         pkgs = import nixpkgs {
           inherit system overlays;
+           config.allowBroken = true;
         };
 
         inherit (pkgs) lib;
@@ -50,7 +50,7 @@
           ];
         };
 
-        toolchain = "latest";
+        toolchain = "complete";
         rustPkg = fenix.packages.${system}.${toolchain}.withComponents
           [
             "cargo"
@@ -109,6 +109,7 @@
             inherit cargoArtifacts;
             partitions = 1;
             partitionType = "count";
+            cargoNextestExtraArgs = "--all-targets";
           });
         } // lib.optionalAttrs (system == "x86_64-linux") {
           # NB: cargo-tarpaulin only supports x86_64 systems
@@ -135,7 +136,24 @@
           nativeBuildInputs = with pkgs; [
             rustPkg
             rust-analyzer-nightly
+            pkg-config
+            git
+            cmake
+            openssl
+
+            cargo-audit
+            cargo-watch
+            cargo-fuzz
           ];
+
+          shellHook = ''
+            BASE=$(git rev-parse --show-toplevel || echo ".")
+
+            # This keeps cargo self contained in this dir
+            export CARGO_HOME=$BASE/.nix-cargo
+            mkdir -p $CARGO_HOME
+            export PATH=$CARGO_HOME/bin:$PATH
+          '';
         };
       });
 }

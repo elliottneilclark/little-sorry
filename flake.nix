@@ -10,12 +10,12 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
-    fenix = {
-      url = "github:nix-community/fenix";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.rust-analyzer-src.follows = "";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs = {
+        nixpkgs.follows = "nixpkgs";
+      };
     };
-
 
     advisory-db = {
       url = "github:rustsec/advisory-db";
@@ -23,127 +23,128 @@
     };
   };
 
-  outputs = { self, nixpkgs, crane, fenix, flake-utils, advisory-db, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      crane,
+      rust-overlay,
+      flake-utils,
+      advisory-db,
+      ...
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
-        overlays = [ fenix.overlays.default ];
         pkgs = import nixpkgs {
-          inherit system overlays;
-           config.allowBroken = true;
+          inherit system;
+          config = {
+            allowBroken = true;
+          };
+          overlays = [ (import rust-overlay) ];
         };
 
         inherit (pkgs) lib;
 
-        craneLib = crane.lib.${system};
+        rust-toolchain = pkgs.rust-bin.selectLatestNightlyWith (
+          toolchain:
+          toolchain.default.override {
+            extensions = [ "rust-src" ];
+            targets = [
+              "aarch64-apple-darwin"
+              "x86_64-apple-darwin"
+              "aarch64-unknown-linux-gnu"
+              "x86_64-unknown-linux-gnu"
+            ];
+          }
+        );
+
+        craneLib = (crane.mkLib pkgs).overrideToolchain rust-toolchain;
         src = craneLib.cleanCargoSource (craneLib.path ./.);
 
-        # Common arguments can be set here to avoid repeating them later
         commonArgs = {
           inherit src;
 
-          buildInputs = [
-            # Add additional build inputs here
-          ]
-          ++ lib.optionals pkgs.stdenv.isDarwin [
-            # Additional darwin specific inputs can be set here
-            pkgs.libiconv
-          ];
+          buildInputs =
+            [ ]
+            ++ lib.optionals pkgs.stdenv.isDarwin [
+              # Additional darwin specific inputs can be set here
+              pkgs.libiconv
+            ];
         };
-
-        toolchain = "complete";
-        rustPkg = fenix.packages.${system}.${toolchain}.withComponents
-          [
-            "cargo"
-            "clippy"
-            "rust-src"
-            "llvm-tools"
-            "rustc"
-            "rustfmt"
-          ];
-
-        craneLibLLvmTools = craneLib.overrideToolchain rustPkg;
 
         # Build *just* the cargo dependencies, so we can reuse
         # all of that work (e.g. via cachix) when running in CI
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        # Build the actual crate itself, reusing the dependency
-        # artifacts from above.
-        rs-poker = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
+        little-sorry = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            doCheck = false;
+          }
+        );
       in
       {
-        checks = {
-          # Build the crate as part of `nix flake check` for convenience
-          inherit rs-poker;
+        checks =
+          {
+            # Build the crate as part of `nix flake check` for convenience
+            inherit little-sorry;
 
-          # Run clippy (and deny all warnings) on the crate source,
-          # again, resuing the dependency artifacts from above.
-          #
-          # Note that this is done as a separate derivation so that
-          # we can block the CI if there are issues here, but not
-          # prevent downstream consumers from building our crate by itself.
-          rs-poker-clippy = craneLib.cargoClippy (commonArgs // {
-            inherit cargoArtifacts;
-            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-          });
+            # Run clippy (and deny all warnings) on the crate source,
+            # again, resuing the dependency artifacts from above.
+            little-sorry-clippy = craneLib.cargoClippy (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+              }
+            );
 
-          rs-poker-doc = craneLib.cargoDoc (commonArgs // {
-            inherit cargoArtifacts;
-          });
+            little-sorry-doc = craneLib.cargoDoc (commonArgs // { inherit cargoArtifacts; });
 
-          # Check formatting
-          rs-poker-fmt = craneLib.cargoFmt {
-            inherit src;
-            cargoClippyExtraArgs = "--all --check";
+            # Check formatting
+            little-sorry-fmt = craneLib.cargoFmt {
+              inherit src;
+              cargoClippyExtraArgs = "--all --check";
+            };
+
+            # Audit dependencies
+            little-sorry-audit = craneLib.cargoAudit { inherit src advisory-db; };
+
+            # Run tests since little-sorry has doCheck = false;
+            little-sorry-nextest = craneLib.cargoNextest (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                partitions = 1;
+                partitionType = "count";
+                cargoNextestExtraArgs = "--all-targets";
+              }
+            );
+          }
+          // lib.optionalAttrs (system == "x86_64-linux") {
+            little-sorry-coverage = craneLib.cargoTarpaulin (commonArgs // { inherit cargoArtifacts; });
           };
-
-          # Audit dependencies
-          rs-poker-audit = craneLib.cargoAudit {
-            inherit src advisory-db;
-          };
-
-          # Run tests with cargo-nextest
-          # Consider setting `doCheck = false` on `rs-poker` if you do not want
-          # the tests to run twice
-          rs-poker-nextest = craneLib.cargoNextest (commonArgs // {
-            inherit cargoArtifacts;
-            partitions = 1;
-            partitionType = "count";
-            cargoNextestExtraArgs = "--all-targets";
-          });
-        } // lib.optionalAttrs (system == "x86_64-linux") {
-          # NB: cargo-tarpaulin only supports x86_64 systems
-          # Check code coverage (note: this will not upload coverage anywhere)
-          rs-poker-coverage = craneLib.cargoTarpaulin (commonArgs // {
-            inherit cargoArtifacts;
-          });
-        };
 
         packages = {
-          default = rs-poker;
-          rs-poker-llvm-coverage = craneLibLLvmTools.cargoLlvmCov (commonArgs // {
-            inherit cargoArtifacts;
-          });
+          inherit little-sorry;
+          default = little-sorry;
         };
 
-        apps.default = flake-utils.lib.mkApp {
-          drv = rs-poker;
-        };
+        apps.default = flake-utils.lib.mkApp { drv = little-sorry; };
 
         devShells.default = pkgs.mkShell {
           inputsFrom = builtins.attrValues self.checks.${system};
 
           nativeBuildInputs = with pkgs; [
-            rustPkg
-            rust-analyzer-nightly
-            pkg-config
-            git
-            cmake
+            rust-toolchain
+            rust-analyzer
             openssl
 
             cargo-audit
-            cargo-watch
-            cargo-fuzz
+            cargo-release
+            cargo-nextest
           ];
 
           shellHook = ''
@@ -155,5 +156,6 @@
             export PATH=$CARGO_HOME/bin:$PATH
           '';
         };
-      });
+      }
+    );
 }

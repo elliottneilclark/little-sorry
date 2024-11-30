@@ -1,6 +1,6 @@
 [package]
 name = "little-sorry"
-version = "0.4.1"
+version = "0.5.0"
 authors = ["Elliott Clark <elliott@batteriesincl.com>"]
 keywords = ["cards", "poker", "regret-minimization", "CFR"]
 categories = ["games"]

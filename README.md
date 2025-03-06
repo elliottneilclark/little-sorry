@@ -15,7 +15,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-little-sorry = "0.5.0"
+little-sorry = "1.0.0"
 ```
 
 ## How It Works

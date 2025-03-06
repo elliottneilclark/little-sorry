@@ -2,15 +2,25 @@
 //! This is a library for exploring regret minimization
 //! with rust. Specifically this is mostly about poker.
 use ndarray::prelude::*;
-use rand::distributions::Distribution;
-use rand::thread_rng;
-use rand_distr::WeightedAliasIndex;
+use rand_distr::Distribution;
+use rand_distr::weighted::WeightedAliasIndex;
 
 use std::vec::Vec;
 
 use crate::errors::LittleError;
 
 #[derive(Debug, Clone)]
+/// A struct representing a regret matcher, which is used to select actions based on the regret
+/// minimization algorithm.
+///
+/// # Fields
+///
+/// * `p` - The probability distribution over experts, representing the chance each expert has of being chosen.
+/// * `sum_p` - The cumulative sum of probabilities over time.
+/// * `expert_reward` - The accumulated reward for each expert.
+/// * `cumulative_reward` - The total reward accumulated over time.
+/// * `dist` - The distribution that generates actions, implemented as a `WeightedAliasIndex`.
+/// * `num_updates` - The number of updates that have been performed.
 pub struct RegretMatcher {
     // The chance each expert has of being chosen
     p: Array1<f32>,
@@ -49,8 +59,9 @@ impl RegretMatcher {
             num_updates: 0,
         })
     }
-    pub fn next_action(&self) -> usize {
-        self.dist.sample(&mut thread_rng())
+
+    pub fn next_action<R: rand::Rng>(&self, rng: &mut R) -> usize {
+        self.dist.sample(rng)
     }
 
     pub fn update_regret(&mut self, reward_array: ArrayView1<f32>) -> Result<(), LittleError> {
@@ -101,6 +112,8 @@ impl RegretMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rng;
+
     #[test]
     fn it_works() {
         assert_eq!(2 + 2, 4);
@@ -114,8 +127,9 @@ mod tests {
     #[test]
     fn test_next_action() {
         let rg = RegretMatcher::new(100).unwrap();
+        let mut rng = rng();
         for _i in 0..500 {
-            let a = rg.next_action();
+            let a = rg.next_action(&mut rng);
             assert!(a < 100);
         }
     }

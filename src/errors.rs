@@ -1,4 +1,4 @@
-use rand_distr::WeightedError;
+use rand_distr::weighted::Error as WeightedError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

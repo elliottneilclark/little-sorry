@@ -1,9 +1,9 @@
 use crate::errors::LittleError;
 use crate::regret_matcher::RegretMatcher;
 use ndarray::prelude::*;
-use once_cell::sync::Lazy;
 use std::cmp;
 use std::mem;
+use std::sync::LazyLock;
 
 use std::vec::Vec;
 
@@ -22,9 +22,9 @@ enum RPSAction {
     Scissors = 2,
 }
 
-static ROCK_REWARD: Lazy<Array1<f32>> = Lazy::new(|| array![0.0_f32, 1.0_f32, -1.0_f32]);
-static PAPER_REWARD: Lazy<Array1<f32>> = Lazy::new(|| array![-1.0_f32, 0.0_f32, 1.0_f32]);
-static SCISSOR_REWARD: Lazy<Array1<f32>> = Lazy::new(|| array![1.0_f32, -1.0_f32, 0.0_f32]);
+static ROCK_REWARD: LazyLock<Array1<f32>> = LazyLock::new(|| array![0.0_f32, 1.0_f32, -1.0_f32]);
+static PAPER_REWARD: LazyLock<Array1<f32>> = LazyLock::new(|| array![-1.0_f32, 0.0_f32, 1.0_f32]);
+static SCISSOR_REWARD: LazyLock<Array1<f32>> = LazyLock::new(|| array![1.0_f32, -1.0_f32, 0.0_f32]);
 
 impl RPSAction {
     /// Converts the action to its corresponding reward array view.

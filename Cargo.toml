@@ -16,11 +16,10 @@ ndarray = "~0.16.1"
 rand = "~0.9.0"
 rand_distr = "~0.5.1"
 thiserror = "~2"
-once_cell = { version = "~1.20.3", optional = true }
 
 [features]
 default = []
-rps = ["dep:once_cell"]
+rps = []
 
 [dev-dependencies]
 criterion = "0.5.1"

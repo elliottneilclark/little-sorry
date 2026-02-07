@@ -1,5 +1,6 @@
+use crate::cfr_plus::CfrPlusRegretMatcher;
 use crate::errors::LittleError;
-use crate::regret_matcher::RegretMatcher;
+use crate::regret_minimizer::RegretMinimizer;
 use ndarray::prelude::*;
 use std::cmp;
 use std::mem;
@@ -62,36 +63,45 @@ impl From<usize> for RPSAction {
 }
 
 /// Runner for the Rock-Paper-Scissors game using regret matching.
+///
+/// This struct is generic over the regret minimization algorithm,
+/// allowing use of CFR+, DCFR, or other implementations.
 #[derive(Debug, Clone)]
-pub struct RPSRunner {
+pub struct RPSRunnerGeneric<M: RegretMinimizer> {
     /// Regret matcher for the first player.
-    pub matcher_one: RegretMatcher,
+    pub matcher_one: M,
     /// Regret matcher for the second player.
-    pub matcher_two: RegretMatcher,
+    pub matcher_two: M,
     pending_reward_one: Array1<f32>,
     pending_reward_two: Array1<f32>,
 }
 
-impl Default for RPSRunner {
-    /// Creates a new `RPSRunner` with default values.
-    fn default() -> Self {
-        Self::new().unwrap()
-    }
-}
-
-impl RPSRunner {
-    /// Creates a new `RPSRunner`.
+impl<M: RegretMinimizer> RPSRunnerGeneric<M> {
+    /// Creates a new `RPSRunnerGeneric`.
     ///
     /// # Returns
     ///
-    /// A result containing the new `RPSRunner` or a `LittleError`.
+    /// A result containing the new runner or a `LittleError`.
     pub fn new() -> Result<Self, LittleError> {
         Ok(Self {
-            matcher_one: RegretMatcher::new(3)?,
-            matcher_two: RegretMatcher::new(3)?,
+            matcher_one: M::new(3)?,
+            matcher_two: M::new(3)?,
             pending_reward_one: Array1::zeros(3),
             pending_reward_two: Array1::zeros(3),
         })
+    }
+
+    /// Creates a new `RPSRunnerGeneric` with pre-configured matchers.
+    ///
+    /// This allows using specific configurations of the regret minimizer.
+    #[must_use]
+    pub fn new_with_matchers(matcher_one: M, matcher_two: M) -> Self {
+        Self {
+            matcher_one,
+            matcher_two,
+            pending_reward_one: Array1::zeros(3),
+            pending_reward_two: Array1::zeros(3),
+        }
     }
 
     /// Runs one iteration of the Rock-Paper-Scissors game.
@@ -143,14 +153,37 @@ impl RPSRunner {
     }
 }
 
+/// Type alias for backwards compatibility with CFR+.
+pub type RPSRunner = RPSRunnerGeneric<CfrPlusRegretMatcher>;
+
+impl Default for RPSRunner {
+    /// Creates a new `RPSRunner` with default values.
+    fn default() -> Self {
+        Self::new().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dcfr::DiscountedRegretMatcher;
 
-    /// Tests the Rock-Paper-Scissors runner.
+    /// Tests the Rock-Paper-Scissors runner with CFR+.
     #[test]
-    fn test_rps() {
+    fn test_rps_cfr_plus() {
         let mut runner = RPSRunner::new().unwrap();
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            runner.run_one(&mut rng);
+            runner.update_regret().unwrap();
+        }
+        dbg!(runner.best_weight());
+    }
+
+    /// Tests the Rock-Paper-Scissors runner with DCFR.
+    #[test]
+    fn test_rps_dcfr() {
+        let mut runner = RPSRunnerGeneric::<DiscountedRegretMatcher>::new().unwrap();
         let mut rng = rand::rng();
         for _ in 0..100 {
             runner.run_one(&mut rng);

@@ -4,112 +4,90 @@
 //! This module provides [`CfrPlusRegretMatcher`], an implementation of the
 //! CFR+ algorithm which floors negative regrets at zero.
 
-use ndarray::prelude::*;
-use rand_distr::Distribution;
-use rand_distr::weighted::WeightedAliasIndex;
-
-use crate::errors::LittleError;
-use crate::regret_minimizer::RegretMinimizer;
+use crate::regret_minimizer::{self, RegretMinimizer};
 
 /// A regret matcher implementing CFR+ (regret matching plus).
 ///
 /// CFR+ differs from vanilla CFR by flooring cumulative regrets at zero.
-/// This can be viewed as DCFR_{∞, -∞, 2}: infinite positive discount
+/// This can be viewed as DCFR_{inf, -inf, 2}: infinite positive discount
 /// (keeping positive regrets), infinite negative discount (flooring at 0),
 /// and linear average strategy weighting.
-///
-/// # Fields
-///
-/// * `p` - The probability distribution over experts.
-/// * `sum_p` - The cumulative sum of probabilities over time.
-/// * `expert_reward` - The accumulated reward for each expert.
-/// * `cumulative_reward` - The total reward accumulated over time.
-/// * `dist` - The weighted alias distribution for O(1) sampling.
-/// * `num_updates` - The number of updates performed.
 #[derive(Debug, Clone)]
 pub struct CfrPlusRegretMatcher {
-    p: Array1<f32>,
-    sum_p: Array1<f32>,
-    expert_reward: Array1<f32>,
+    p: Vec<f32>,
+    sum_p: Vec<f32>,
+    expert_reward: Vec<f32>,
     cumulative_reward: f32,
-    dist: WeightedAliasIndex<f32>,
     num_updates: usize,
 }
 
 impl CfrPlusRegretMatcher {
-    fn init_weights(num_experts: usize) -> Vec<f32> {
-        vec![1.0 / num_experts as f32; num_experts]
-    }
-
     /// Creates a new `CfrPlusRegretMatcher` with custom initial probabilities.
     ///
-    /// # Arguments
+    /// # Panics
     ///
-    /// * `p` - Initial probability distribution over actions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LittleError`] if the probability distribution is invalid.
-    pub fn new_from_p(p: Vec<f32>) -> Result<Self, LittleError> {
-        let num_experts = p.len();
-        let dist = WeightedAliasIndex::new(p.clone())?;
-        Ok(Self {
-            p: Array1::from(p),
-            sum_p: Array1::zeros(num_experts),
-            cumulative_reward: 0.0_f32,
-            expert_reward: Array1::from(vec![0.0_f32; num_experts]),
-            dist,
+    /// Panics if `p` is empty.
+    #[must_use]
+    pub fn new_from_p(p: Vec<f32>) -> Self {
+        assert!(!p.is_empty(), "must have at least one expert");
+        let n = p.len();
+        Self {
+            p,
+            sum_p: vec![0.0; n],
+            cumulative_reward: 0.0,
+            expert_reward: vec![0.0; n],
             num_updates: 0,
-        })
+        }
     }
 }
 
 impl RegretMinimizer for CfrPlusRegretMatcher {
-    fn new(num_experts: usize) -> Result<Self, LittleError> {
-        let p = Self::init_weights(num_experts);
-        Self::new_from_p(p)
+    fn new(num_experts: usize) -> Self {
+        Self::new_from_p(regret_minimizer::uniform_weights(num_experts))
     }
 
-    fn next_action<R: rand::Rng>(&self, rng: &mut R) -> usize {
-        self.dist.sample(rng)
-    }
-
-    fn update_regret(&mut self, reward_array: ArrayView1<f32>) -> Result<(), LittleError> {
-        let num_experts = self.p.len();
-        // Compute expected reward
-        let r = self.p.dot(&reward_array);
+    fn update_regret(&mut self, rewards: &[f32]) {
+        let n = self.p.len();
+        let r = regret_minimizer::dot(&self.p, rewards);
         self.cumulative_reward += r;
-        // Accumulate expert rewards
-        self.expert_reward += &reward_array;
-        // Regret = what expert would have earned - what we earned
-        let regret = &self.expert_reward - self.cumulative_reward;
-        // CFR+: floor negative regrets at 0
-        let capped_regret: Array1<f32> = regret.iter().map(|v: &f32| f32::max(0.0, *v)).collect();
-        let regret_sum = capped_regret.sum();
+        regret_minimizer::add_assign(&mut self.expert_reward, rewards);
+
+        // Compute capped regrets into p and their sum
+        let mut regret_sum = 0.0_f32;
+        for i in 0..n {
+            let regret = (self.expert_reward[i] - self.cumulative_reward).max(0.0);
+            self.p[i] = regret;
+            regret_sum += regret;
+        }
 
         if regret_sum <= 0.0 {
             // Reset if all regrets are zero or negative
-            self.p = Array1::from(Self::init_weights(num_experts));
+            regret_minimizer::uniform_fill(&mut self.p);
             self.cumulative_reward = 0.0;
-            self.expert_reward = Array1::zeros(num_experts);
+            self.expert_reward.fill(0.0);
             self.num_updates = 0;
         } else {
             // Normalize to get new strategy
-            self.p = capped_regret / regret_sum;
+            let inv = 1.0 / regret_sum;
+            for pi in self.p.iter_mut() {
+                *pi *= inv;
+            }
             // Accumulate for average strategy
-            self.sum_p += &self.p;
+            regret_minimizer::add_assign(&mut self.sum_p, &self.p);
             self.num_updates += 1;
         }
-        self.dist = WeightedAliasIndex::new(self.p.to_vec())?;
-        Ok(())
-    }
-
-    fn best_weight(&self) -> Vec<f32> {
-        (self.sum_p.clone() / self.num_updates as f32).to_vec()
     }
 
     fn num_updates(&self) -> usize {
         self.num_updates
+    }
+
+    fn current_strategy(&self) -> &[f32] {
+        &self.p
+    }
+
+    fn cumulative_strategy(&self) -> &[f32] {
+        &self.sum_p
     }
 }
 
@@ -125,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_next_action() {
-        let rg = CfrPlusRegretMatcher::new(100).unwrap();
+        let rg = CfrPlusRegretMatcher::new(100);
         let mut rng = rng();
         for _i in 0..500 {
             let a = rg.next_action(&mut rng);
@@ -135,12 +113,10 @@ mod tests {
 
     #[test]
     fn test_num_updates_increments() {
-        let mut rm = CfrPlusRegretMatcher::new(3).unwrap();
+        let mut rm = CfrPlusRegretMatcher::new(3);
         assert_eq!(rm.num_updates(), 0);
 
-        // After update, num_updates should increase
-        let rewards = array![1.0_f32, 0.0_f32, -1.0_f32];
-        rm.update_regret(rewards.view()).unwrap();
+        rm.update_regret(&[1.0, 0.0, -1.0]);
         assert_eq!(rm.num_updates(), 1);
     }
 }

@@ -18,11 +18,11 @@ fn compute_exploitability(weights: &[f32]) -> f32 {
 }
 
 fn run_algorithm<M: RegretMinimizer>(iterations: usize) -> f32 {
-    let mut runner = RPSRunnerGeneric::<M>::new().unwrap();
+    let mut runner = RPSRunnerGeneric::<M>::new();
     let mut rng = rand::rng();
     for _ in 0..iterations {
         runner.run_one(&mut rng);
-        runner.update_regret().unwrap();
+        runner.update_regret();
     }
     compute_exploitability(&runner.best_weight())
 }

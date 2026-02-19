@@ -1,13 +1,19 @@
 # Little Sorry
 
-A Rust library for exploring regret minimization algorithms, with a focus on game theory applications.
+A Rust library for regret minimization algorithms (Counterfactual Regret Minimization) used to find Nash equilibrium strategies in imperfect-information games.
 
 ## Features
 
-- Regret matching implementation
-- Rock Paper Scissors (RPS) example game
-- Highly performant using ndarray for numerical operations
-- Thread-safe with no unsafe code (except for carefully bounded enum conversions)
+- **6 CFR variants** via the `RegretMinimizer` trait:
+  - **CFR+** — regret clipping at zero
+  - **Discounted CFR (DCFR)** — time-based discounting with configurable parameters
+  - **DCFR+** — combines DCFR discounting with CFR+ clipping
+  - **Linear CFR** — linear time-weighted regrets
+  - **Predictive CFR+ (PCFR+)** — uses future regret predictions
+  - **Predictive DCFR+ (PDCFR+)** — combines DCFR+ discounting with predictive updates
+- Zero-allocation hot path — no heap allocations during `update_regret`
+- Minimal dependencies (`rand` only)
+- Rock-Paper-Scissors example game (feature-gated behind `rps`)
 
 ## Getting Started
 
@@ -15,30 +21,55 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-little-sorry = "1.0.0"
+little-sorry = "1.1.0"
 ```
 
-## How It Works
+### Quick Example
 
-The library implements regret minimization algorithms, which are used in game theory to find optimal strategies in imperfect-information games. The core algorithm tracks:
+```rust
+use little_sorry::{CfrPlusRegretMatcher, RegretMinimizer};
 
-1. Action probabilities for each possible move
-2. Cumulative regret for not taking alternative actions
-3. Strategy updates based on regret matching
+let mut matcher = CfrPlusRegretMatcher::new(3);
 
-The RPS example demonstrates these concepts in a simple zero-sum game setting.
+// Run many iterations of regret updates
+for _ in 0..1000 {
+    let rewards = &[1.0, -0.5, 0.2];
+    matcher.update_regret(rewards);
+}
+
+// Get the Nash equilibrium approximation
+let strategy = matcher.best_weight();
+```
+
+All variants implement the `RegretMinimizer` trait, so you can swap algorithms generically:
+
+```rust
+use little_sorry::{DiscountedRegretMatcher, RegretMinimizer};
+
+fn train<M: RegretMinimizer>(matcher: &mut M, iterations: usize) {
+    for _ in 0..iterations {
+        let rewards = &[1.0, -0.5, 0.2];
+        matcher.update_regret(rewards);
+    }
+}
+```
 
 ## Building and Testing
 
+This project uses [mise](https://mise.jdx.dev/) to manage tooling and tasks.
+
 ```bash
-# Run all tests
-cargo test
+# Run all checks (formatting, linting, tests, TOML validation)
+mise check
+
+# Run tests
+mise run check:test:nextest
 
 # Run benchmarks
-cargo bench
+cargo bench --features rps
 
-# Build in release mode
-cargo build --release
+# Run the RPS example
+cargo run --release --features rps --bin run_rps
 ```
 
 ## License

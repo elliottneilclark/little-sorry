@@ -7,13 +7,8 @@
 //! Reference: "Equilibrium Finding with Weighted Regret Minimization"
 //! (arXiv:2404.13891)
 
-use ndarray::prelude::*;
-use rand_distr::Distribution;
-use rand_distr::weighted::WeightedAliasIndex;
-
 use crate::discount::DiscountParams;
-use crate::errors::LittleError;
-use crate::regret_minimizer::RegretMinimizer;
+use crate::regret_minimizer::{self, RegretMinimizer};
 
 /// A regret matcher implementing DCFR+.
 ///
@@ -22,64 +17,45 @@ use crate::regret_minimizer::RegretMinimizer;
 /// regular DCFR is that the clipping to non-negative values happens
 /// AFTER adding the instantaneous regret, not before.
 ///
-/// Update rule: `R^t = [R^{t-1} * d(t-1, α) + r^t]^+`
+/// Update rule: `R^t = [R^{t-1} * d(t-1, alpha) + r^t]^+`
 ///
-/// where `d(t, α) = t^α / (t^α + 1)`.
+/// where `d(t, alpha) = t^alpha / (t^alpha + 1)`.
 ///
-/// Recommended parameters: α = 1.5, γ = 4
+/// Recommended parameters: alpha = 1.5, gamma = 4
 #[derive(Debug, Clone)]
 pub struct DcfrPlusRegretMatcher {
     alpha: f32,
     gamma: f32,
-    p: Array1<f32>,
-    sum_p: Array1<f32>,
-    cumulative_regret: Array1<f32>,
-    dist: WeightedAliasIndex<f32>,
+    p: Vec<f32>,
+    sum_p: Vec<f32>,
+    cumulative_regret: Vec<f32>,
     num_updates: usize,
 }
 
 impl DcfrPlusRegretMatcher {
-    fn init_weights(num_experts: usize) -> Vec<f32> {
-        vec![1.0 / num_experts as f32; num_experts]
-    }
-
     /// Creates a new `DcfrPlusRegretMatcher` with custom parameters.
     ///
-    /// # Arguments
+    /// # Panics
     ///
-    /// * `num_experts` - The number of available actions.
-    /// * `alpha` - Regret discount exponent (recommended: 1.5).
-    /// * `gamma` - Strategy discount exponent (recommended: 4.0).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LittleError`] if initialization fails.
-    pub fn new_with_params(
-        num_experts: usize,
-        alpha: f32,
-        gamma: f32,
-    ) -> Result<Self, LittleError> {
-        let p = Self::init_weights(num_experts);
-        let dist = WeightedAliasIndex::new(p.clone())?;
-        Ok(Self {
+    /// Panics if `num_experts` is 0.
+    #[must_use]
+    pub fn new_with_params(num_experts: usize, alpha: f32, gamma: f32) -> Self {
+        let p = regret_minimizer::uniform_weights(num_experts);
+        Self {
             alpha,
             gamma,
-            p: Array1::from(p),
-            sum_p: Array1::zeros(num_experts),
-            cumulative_regret: Array1::zeros(num_experts),
-            dist,
+            p,
+            sum_p: vec![0.0; num_experts],
+            cumulative_regret: vec![0.0; num_experts],
             num_updates: 0,
-        })
+        }
     }
 
     /// Creates a new `DcfrPlusRegretMatcher` with recommended parameters.
     ///
-    /// Uses α = 1.5, γ = 4.0 as recommended in the paper.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LittleError`] if initialization fails.
-    pub fn recommended(num_experts: usize) -> Result<Self, LittleError> {
+    /// Uses alpha = 1.5, gamma = 4.0 as recommended in the paper.
+    #[must_use]
+    pub fn recommended(num_experts: usize) -> Self {
         Self::new_with_params(num_experts, 1.5, 4.0)
     }
 
@@ -97,71 +73,50 @@ impl DcfrPlusRegretMatcher {
 }
 
 impl RegretMinimizer for DcfrPlusRegretMatcher {
-    fn new(num_experts: usize) -> Result<Self, LittleError> {
+    fn new(num_experts: usize) -> Self {
         Self::recommended(num_experts)
     }
 
-    fn next_action<R: rand::Rng>(&self, rng: &mut R) -> usize {
-        self.dist.sample(rng)
-    }
-
-    fn update_regret(&mut self, reward_array: ArrayView1<f32>) -> Result<(), LittleError> {
-        let num_experts = self.p.len();
+    fn update_regret(&mut self, rewards: &[f32]) {
         let t = self.num_updates + 1;
 
-        // Compute discount factor for regrets: (t-1)^α / ((t-1)^α + 1)
         let regret_discount = if t > 1 {
             DiscountParams::discount_factor(t - 1, self.alpha)
         } else {
-            0.0 // No previous regret to discount on first iteration
+            0.0
         };
-
-        // Compute strategy discount: ((t-1)/t)^γ
         let strategy_discount = if t > 1 {
             ((t - 1) as f32 / t as f32).powf(self.gamma)
         } else {
             0.0
         };
 
-        // Compute instantaneous regret
-        let expected_reward = self.p.dot(&reward_array);
-        let instantaneous_regret = &reward_array - expected_reward;
+        let expected = regret_minimizer::dot(&self.p, rewards);
 
-        // DCFR+ update: R^t = [R^{t-1} * d(t-1, α) + r^t]^+
-        // The clipping happens AFTER adding instantaneous regret
-        for i in 0..num_experts {
-            let discounted = self.cumulative_regret[i] * regret_discount;
-            self.cumulative_regret[i] = f32::max(0.0, discounted + instantaneous_regret[i]);
+        // DCFR+ update: R^t = [R^{t-1} * d(t-1, alpha) + r^t]^+
+        for (cr, &rw) in self.cumulative_regret.iter_mut().zip(rewards) {
+            *cr = (*cr * regret_discount + rw - expected).max(0.0);
         }
 
-        // Compute new strategy via regret matching
-        let regret_sum = self.cumulative_regret.sum();
+        regret_minimizer::regret_match(&self.cumulative_regret, &mut self.p);
 
-        if regret_sum <= 0.0 {
-            self.p = Array1::from(Self::init_weights(num_experts));
-        } else {
-            self.p = self.cumulative_regret.clone() / regret_sum;
+        // Discounted cumulative strategy
+        for (sp, &pi) in self.sum_p.iter_mut().zip(self.p.iter()) {
+            *sp = *sp * strategy_discount + pi;
         }
-
-        // Update average strategy with discount
-        self.sum_p = &self.sum_p * strategy_discount + &self.p;
         self.num_updates += 1;
-
-        self.dist = WeightedAliasIndex::new(self.p.to_vec())?;
-        Ok(())
-    }
-
-    fn best_weight(&self) -> Vec<f32> {
-        let sum = self.sum_p.sum();
-        if sum <= 0.0 {
-            Self::init_weights(self.p.len())
-        } else {
-            (self.sum_p.clone() / sum).to_vec()
-        }
     }
 
     fn num_updates(&self) -> usize {
         self.num_updates
+    }
+
+    fn current_strategy(&self) -> &[f32] {
+        &self.p
+    }
+
+    fn cumulative_strategy(&self) -> &[f32] {
+        &self.sum_p
     }
 }
 
@@ -172,21 +127,21 @@ mod tests {
 
     #[test]
     fn test_dcfr_plus_new() {
-        let rm = DcfrPlusRegretMatcher::new(3).unwrap();
+        let rm = DcfrPlusRegretMatcher::new(3);
         assert!((rm.alpha() - 1.5).abs() < 1e-6);
         assert!((rm.gamma() - 4.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_dcfr_plus_custom_params() {
-        let rm = DcfrPlusRegretMatcher::new_with_params(3, 2.0, 3.0).unwrap();
+        let rm = DcfrPlusRegretMatcher::new_with_params(3, 2.0, 3.0);
         assert!((rm.alpha() - 2.0).abs() < 1e-6);
         assert!((rm.gamma() - 3.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_next_action() {
-        let rm = DcfrPlusRegretMatcher::new(100).unwrap();
+        let rm = DcfrPlusRegretMatcher::new(100);
         let mut rng = rng();
         for _ in 0..500 {
             let a = rm.next_action(&mut rng);
@@ -196,11 +151,10 @@ mod tests {
 
     #[test]
     fn test_best_weight_sums_to_one() {
-        let mut rm = DcfrPlusRegretMatcher::new(3).unwrap();
-        let rewards = array![1.0_f32, 0.0_f32, -1.0_f32];
+        let mut rm = DcfrPlusRegretMatcher::new(3);
 
         for _ in 0..10 {
-            rm.update_regret(rewards.view()).unwrap();
+            rm.update_regret(&[1.0, 0.0, -1.0]);
         }
 
         let weights = rm.best_weight();

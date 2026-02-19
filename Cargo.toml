@@ -44,6 +44,11 @@ harness = false
 name = "convergence"
 required-features = ["rps"]
 
+[package.metadata.release]
+pre-release-replacements = [
+  { file = "README.md", search = "little-sorry = \"[^\"]+\"", replace = "little-sorry = \"{{version}}\"" },
+]
+
 [profile.release]
 debug = true
 lto = true

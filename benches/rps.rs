@@ -14,12 +14,12 @@ use little_sorry::rps::{RPSRunner, RPSRunnerGeneric};
 pub fn bench_cfr_plus(c: &mut Criterion) {
     c.bench_function("cfr_plus_iter", move |b| {
         b.iter_custom(|iters| {
-            let mut runner = RPSRunner::new().unwrap();
+            let mut runner = RPSRunner::new();
             let mut rng = rand::rng();
             let start = Instant::now();
             for _i in 0..iters {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
             }
             start.elapsed()
         })
@@ -29,12 +29,12 @@ pub fn bench_cfr_plus(c: &mut Criterion) {
 pub fn bench_dcfr_recommended(c: &mut Criterion) {
     c.bench_function("dcfr_recommended_iter", move |b| {
         b.iter_custom(|iters| {
-            let mut runner = RPSRunnerGeneric::<DiscountedRegretMatcher>::new().unwrap();
+            let mut runner = RPSRunnerGeneric::<DiscountedRegretMatcher>::new();
             let mut rng = rand::rng();
             let start = Instant::now();
             for _i in 0..iters {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
             }
             start.elapsed()
         })
@@ -44,12 +44,12 @@ pub fn bench_dcfr_recommended(c: &mut Criterion) {
 pub fn bench_dcfr_plus(c: &mut Criterion) {
     c.bench_function("dcfr_plus_iter", move |b| {
         b.iter_custom(|iters| {
-            let mut runner = RPSRunnerGeneric::<DcfrPlusRegretMatcher>::new().unwrap();
+            let mut runner = RPSRunnerGeneric::<DcfrPlusRegretMatcher>::new();
             let mut rng = rand::rng();
             let start = Instant::now();
             for _i in 0..iters {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
             }
             start.elapsed()
         })
@@ -59,12 +59,12 @@ pub fn bench_dcfr_plus(c: &mut Criterion) {
 pub fn bench_linear_cfr(c: &mut Criterion) {
     c.bench_function("linear_cfr_iter", move |b| {
         b.iter_custom(|iters| {
-            let mut runner = RPSRunnerGeneric::<LinearCfrRegretMatcher>::new().unwrap();
+            let mut runner = RPSRunnerGeneric::<LinearCfrRegretMatcher>::new();
             let mut rng = rand::rng();
             let start = Instant::now();
             for _i in 0..iters {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
             }
             start.elapsed()
         })
@@ -74,12 +74,12 @@ pub fn bench_linear_cfr(c: &mut Criterion) {
 pub fn bench_pcfr_plus(c: &mut Criterion) {
     c.bench_function("pcfr_plus_iter", move |b| {
         b.iter_custom(|iters| {
-            let mut runner = RPSRunnerGeneric::<PcfrPlusRegretMatcher>::new().unwrap();
+            let mut runner = RPSRunnerGeneric::<PcfrPlusRegretMatcher>::new();
             let mut rng = rand::rng();
             let start = Instant::now();
             for _i in 0..iters {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
             }
             start.elapsed()
         })
@@ -89,12 +89,12 @@ pub fn bench_pcfr_plus(c: &mut Criterion) {
 pub fn bench_pdcfr_plus(c: &mut Criterion) {
     c.bench_function("pdcfr_plus_iter", move |b| {
         b.iter_custom(|iters| {
-            let mut runner = RPSRunnerGeneric::<PdcfrPlusRegretMatcher>::new().unwrap();
+            let mut runner = RPSRunnerGeneric::<PdcfrPlusRegretMatcher>::new();
             let mut rng = rand::rng();
             let start = Instant::now();
             for _i in 0..iters {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
             }
             start.elapsed()
         })
@@ -112,13 +112,13 @@ fn compute_exploitability(weights: &[f32]) -> f32 {
 fn bench_convergence_for<M: RegretMinimizer>(name: &str, c: &mut Criterion) {
     c.bench_function(&format!("convergence_{}", name), |b| {
         b.iter_custom(|_iters| {
-            let mut runner = RPSRunnerGeneric::<M>::new().unwrap();
+            let mut runner = RPSRunnerGeneric::<M>::new();
             let mut rng = rand::rng();
             let start = Instant::now();
 
             loop {
                 runner.run_one(&mut rng);
-                runner.update_regret().unwrap();
+                runner.update_regret();
 
                 if compute_exploitability(&runner.best_weight()) < 0.01 {
                     break;

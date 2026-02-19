@@ -17,8 +17,6 @@ const CONVERGENCE_TOLERANCE: f32 = 0.05;
 const NUM_ITERATIONS: usize = 10_000;
 
 /// Computes the exploitability of a strategy in RPS.
-///
-/// For RPS, this is the maximum deviation from Nash equilibrium.
 fn compute_exploitability(weights: &[f32]) -> f32 {
     weights
         .iter()
@@ -28,12 +26,12 @@ fn compute_exploitability(weights: &[f32]) -> f32 {
 
 /// Helper to test convergence for any RegretMinimizer
 fn test_convergence<M: RegretMinimizer>(name: &str) {
-    let mut runner = RPSRunnerGeneric::<M>::new().unwrap();
+    let mut runner = RPSRunnerGeneric::<M>::new();
     let mut rng = rand::rng();
 
     for _ in 0..NUM_ITERATIONS {
         runner.run_one(&mut rng);
-        runner.update_regret().unwrap();
+        runner.update_regret();
     }
 
     let weights = runner.best_weight();
@@ -80,17 +78,15 @@ fn test_pdcfr_plus_converges_to_nash_rps() {
 
 #[test]
 fn test_exploitability_converges_to_low_value() {
-    let mut runner = RPSRunnerGeneric::<DiscountedRegretMatcher>::new().unwrap();
+    let mut runner = RPSRunnerGeneric::<DiscountedRegretMatcher>::new();
     let mut rng = rand::rng();
 
-    // Run for many iterations
     for _ in 0..10000 {
         runner.run_one(&mut rng);
-        runner.update_regret().unwrap();
+        runner.update_regret();
     }
     let final_exploitability = compute_exploitability(&runner.best_weight());
 
-    // After 10000 iterations, exploitability should be low
     assert!(
         final_exploitability < CONVERGENCE_TOLERANCE,
         "Exploitability should be low after many iterations. Got: {}",
@@ -102,7 +98,6 @@ fn test_exploitability_converges_to_low_value() {
 fn test_all_algorithms_converge() {
     const TEST_ITERATIONS: usize = 5000;
 
-    // Test all algorithms in parallel and collect results
     let algorithms: Vec<(&str, f32)> = vec![
         (
             "CFR+",
@@ -143,12 +138,12 @@ fn test_all_algorithms_converge() {
 }
 
 fn run_and_get_exploitability<M: RegretMinimizer>(iterations: usize) -> f32 {
-    let mut runner = RPSRunnerGeneric::<M>::new().unwrap();
+    let mut runner = RPSRunnerGeneric::<M>::new();
     let mut rng = rand::rng();
 
     for _ in 0..iterations {
         runner.run_one(&mut rng);
-        runner.update_regret().unwrap();
+        runner.update_regret();
     }
 
     compute_exploitability(&runner.best_weight())

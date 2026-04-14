@@ -75,6 +75,7 @@ pub(crate) fn uniform_fill(p: &mut [f32]) {
 
 /// Sample an action index from a probability distribution using cumulative sum.
 pub(crate) fn sample_action<R: rand::Rng>(p: &[f32], rng: &mut R) -> usize {
+    use rand::RngExt;
     let r: f32 = rng.random();
     let mut cumsum = 0.0;
     for (i, &prob) in p.iter().enumerate() {

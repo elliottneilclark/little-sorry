@@ -21,7 +21,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-little-sorry = "2.0.0"
+little-sorry = "2.1.0"
 ```
 
 ### Quick Example

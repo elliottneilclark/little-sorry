@@ -32,17 +32,25 @@ This is a Rust library implementing regret minimization algorithms for game theo
 
 ## Core Components
 
-- **RegretMatcher** (`src/regret_matcher.rs`): The main algorithm implementation. Tracks probability distributions over actions, cumulative regrets, and updates strategy based on regret matching. Uses `WeightedAliasIndex` for O(1) action sampling.
+- **RegretMinimizer** (`src/regret_minimizer.rs`): Core trait shared by every CFR variant. Defines the regret-matching interface — required methods `new`, `update_regret`, `num_updates`, `current_strategy`, `cumulative_strategy`, `cumulative_regret`; default-provided diagnostics `next_action`, `best_weight`, `regret_weight_total`, `average_regret`. Also holds the `regret_match` helper.
 
-- **RPSRunner** (`src/rps.rs`): Example implementation using Rock-Paper-Scissors as a demonstration game. Feature-gated behind `rps`. Shows how to use `RegretMatcher` for a two-player zero-sum game.
+- **Regret matchers** — one module per algorithm, each implementing `RegretMinimizer`:
+  - `CfrPlusRegretMatcher` (`src/cfr_plus.rs`) — CFR+; also re-exported as `RegretMatcher`.
+  - `DiscountedRegretMatcher` (`src/dcfr.rs`) — DCFR.
+  - `DcfrPlusRegretMatcher` (`src/dcfr_plus.rs`) — DCFR+.
+  - `LinearCfrRegretMatcher` (`src/linear_cfr.rs`) — Linear CFR.
+  - `PcfrPlusRegretMatcher` (`src/pcfr_plus.rs`) — PCFR+ (predictive).
+  - `PdcfrPlusRegretMatcher` (`src/pdcfr_plus.rs`) — PDCFR+ (predictive + discounted).
 
-- **LittleError** (`src/errors.rs`): Error type using `thiserror`, primarily wrapping weight distribution errors.
+- **DiscountParams** (`src/discount.rs`): Discount-factor parameters (alpha/beta/gamma) used by the discounted variants.
+
+- **RPSRunnerGeneric** (`src/rps.rs`): Example harness using Rock-Paper-Scissors, generic over any `RegretMinimizer` (`RPSRunner` is the `CfrPlusRegretMatcher` alias). Feature-gated behind `rps`.
 
 ## Key Design Patterns
 
-- Uses `ndarray` for numerical operations (Array1<f32> for probability/reward vectors)
+- Numerical operations use plain `Vec<f32>` / `&[f32]` slices (no `ndarray`). Shared numeric kernels live in two crate-internal modules: `vector_ops` (element-wise f32 kernels: `dot`, `add_assign`, `scaled_add_assign`, `discounted_accumulate`) and `probability` (simplex operations: uniform construction, normalization, categorical sampling)
 - The RPS module uses `unsafe` transmute for bounded enum conversion (usize to RPSAction), clamped to valid range
-- Static reward arrays use `LazyLock` for lazy initialization
+- RPS reward vectors are compile-time `const [f32; 3]` arrays (`ROCK_REWARD`/`PAPER_REWARD`/`SCISSOR_REWARD`), returned as `&'static [f32]`
 - Clippy lints enforced with `#![deny(clippy::all)]`; the binary also denies `clippy::pedantic`
 - Uses Rust nightly edition 2024
 

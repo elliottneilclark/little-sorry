@@ -7,7 +7,8 @@
 //! Reference: "Equilibrium Finding with Weighted Regret Minimization"
 //! (arXiv:2404.13891)
 
-use crate::regret_minimizer::{self, RegretMinimizer};
+use crate::regret_minimizer::RegretMinimizer;
+use crate::{probability, vector_ops};
 
 /// A regret matcher implementing PCFR+ (Predictive CFR+).
 ///
@@ -31,7 +32,7 @@ pub struct PcfrPlusRegretMatcher {
 
 impl RegretMinimizer for PcfrPlusRegretMatcher {
     fn new(num_experts: usize) -> Self {
-        let p = regret_minimizer::uniform_weights(num_experts);
+        let p = probability::uniform_weights(num_experts);
         Self {
             p,
             sum_p: vec![0.0; num_experts],
@@ -44,7 +45,7 @@ impl RegretMinimizer for PcfrPlusRegretMatcher {
     fn update_regret(&mut self, rewards: &[f32]) {
         let t = self.num_updates + 1;
 
-        let expected = regret_minimizer::dot(&self.p, rewards);
+        let expected = vector_ops::dot(&self.p, rewards);
 
         // CFR+ regret update + store instantaneous for prediction
         for ((cr, lr), &rw) in self
@@ -67,13 +68,11 @@ impl RegretMinimizer for PcfrPlusRegretMatcher {
         {
             *pi = (cr + lr).max(0.0);
         }
-        regret_minimizer::normalize_inplace(&mut self.p);
+        probability::normalize_inplace(&mut self.p);
 
         // Quadratic weighting: X^t = X^{t-1} + t^2 * x^t
         let weight = (t * t) as f32;
-        for (sp, &pi) in self.sum_p.iter_mut().zip(self.p.iter()) {
-            *sp += weight * pi;
-        }
+        vector_ops::scaled_add_assign(&mut self.sum_p, weight, &self.p);
         self.num_updates += 1;
     }
 
@@ -87,6 +86,10 @@ impl RegretMinimizer for PcfrPlusRegretMatcher {
 
     fn cumulative_strategy(&self) -> &[f32] {
         &self.sum_p
+    }
+
+    fn cumulative_regret(&self) -> &[f32] {
+        &self.cumulative_regret
     }
 }
 
@@ -130,5 +133,58 @@ mod tests {
 
         rm.update_regret(&[1.0, 0.0, -1.0]);
         assert_eq!(rm.num_updates(), 1);
+    }
+
+    #[test]
+    fn test_cumulative_regret_len() {
+        let mut rm = PcfrPlusRegretMatcher::new(4);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+
+        rm.update_regret(&[1.0, 0.0, -1.0, 0.5]);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+    }
+
+    #[test]
+    fn test_average_regret_zero_before_updates() {
+        let rm = PcfrPlusRegretMatcher::new(3);
+        assert_eq!(rm.average_regret(), 0.0);
+    }
+
+    #[test]
+    fn test_average_regret_positive_after_dominant_action() {
+        let mut rm = PcfrPlusRegretMatcher::new(3);
+        rm.update_regret(&[1.0, 0.0, -1.0]);
+        assert!(rm.average_regret() > 0.0);
+    }
+
+    /// CFR+ regret accumulation: `R^t = [R^{t-1} + r^t]^+`, where the
+    /// instantaneous regret is `r^t = reward - dot(strategy, reward)`.
+    #[test]
+    fn test_cumulative_regret_matches_hand_computation() {
+        let mut rm = PcfrPlusRegretMatcher::new(3);
+
+        // Update 1 from uniform strategy [1/3, 1/3, 1/3]:
+        //   expected = (1.0 + 0.5 + 0.0) / 3 = 0.5
+        //   inst     = [0.5, 0.0, -0.5]
+        //   R^1      = [0.5, 0.0, 0.0]   (negative floored)
+        rm.update_regret(&[1.0, 0.5, 0.0]);
+        let cr = rm.cumulative_regret();
+        assert!((cr[0] - 0.5).abs() < 1e-6);
+        assert!(cr[1].abs() < 1e-6);
+        assert!(cr[2].abs() < 1e-6);
+        assert!((rm.average_regret() - 0.5).abs() < 1e-6);
+
+        // After update 1 the strategy saturates to [1, 0, 0].
+        // Update 2 with reward favoring action 1:
+        //   expected = dot([1,0,0], [0,1,0]) = 0.0
+        //   inst     = [0.0, 1.0, 0.0]
+        //   R^2      = [0.5, 1.0, 0.0]
+        rm.update_regret(&[0.0, 1.0, 0.0]);
+        let cr = rm.cumulative_regret();
+        assert!((cr[0] - 0.5).abs() < 1e-6);
+        assert!((cr[1] - 1.0).abs() < 1e-6);
+        assert!(cr[2].abs() < 1e-6);
+        // max positive regret = 1.0, W = T = 2 → 0.5
+        assert!((rm.average_regret() - 0.5).abs() < 1e-6);
     }
 }

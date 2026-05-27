@@ -39,6 +39,9 @@ pub mod pcfr_plus;
 pub mod pdcfr_plus;
 pub mod regret_minimizer;
 
+mod probability;
+mod vector_ops;
+
 #[cfg(feature = "rps")]
 pub mod rps;
 

@@ -6,6 +6,7 @@
 
 use crate::discount::DiscountParams;
 use crate::regret_minimizer::{self, RegretMinimizer};
+use crate::{probability, vector_ops};
 
 /// A regret matcher implementing discounted CFR (DCFR).
 ///
@@ -21,6 +22,7 @@ pub struct DiscountedRegretMatcher {
     p: Vec<f32>,
     sum_p: Vec<f32>,
     cumulative_regret: Vec<f32>,
+    regret_weight: f32,
     num_updates: usize,
 }
 
@@ -32,12 +34,13 @@ impl DiscountedRegretMatcher {
     /// Panics if `num_experts` is 0.
     #[must_use]
     pub fn new_with_params(num_experts: usize, params: DiscountParams) -> Self {
-        let p = regret_minimizer::uniform_weights(num_experts);
+        let p = probability::uniform_weights(num_experts);
         Self {
             params,
             p,
             sum_p: vec![0.0; num_experts],
             cumulative_regret: vec![0.0; num_experts],
+            regret_weight: 0.0,
             num_updates: 0,
         }
     }
@@ -85,7 +88,7 @@ impl RegretMinimizer for DiscountedRegretMatcher {
         let negative_discount = DiscountParams::discount_factor(t, self.params.beta);
         let strategy_discount = (t as f32 / (t as f32 + 1.0)).powf(self.params.gamma);
 
-        let expected = regret_minimizer::dot(&self.p, rewards);
+        let expected = vector_ops::dot(&self.p, rewards);
 
         // Apply sign-based discounting and add instantaneous regret
         for (cr, &rw) in self.cumulative_regret.iter_mut().zip(rewards) {
@@ -99,10 +102,12 @@ impl RegretMinimizer for DiscountedRegretMatcher {
 
         regret_minimizer::regret_match(&self.cumulative_regret, &mut self.p);
 
+        // Track the discounted regret-weight sum `W^t = W^{t-1} * d + 1`,
+        // mirroring the positive-regret discount applied to the accumulator.
+        self.regret_weight = self.regret_weight * positive_discount + 1.0;
+
         // Discount and update cumulative strategy
-        for (sp, &pi) in self.sum_p.iter_mut().zip(self.p.iter()) {
-            *sp = *sp * strategy_discount + pi;
-        }
+        vector_ops::discounted_accumulate(&mut self.sum_p, strategy_discount, &self.p);
         self.num_updates += 1;
     }
 
@@ -116,6 +121,16 @@ impl RegretMinimizer for DiscountedRegretMatcher {
 
     fn cumulative_strategy(&self) -> &[f32] {
         &self.sum_p
+    }
+
+    fn cumulative_regret(&self) -> &[f32] {
+        &self.cumulative_regret
+    }
+
+    /// DCFR discounts older regret, so the weight total is the tracked
+    /// discounted sum `Σ_t ∏_{s>t} d(s, alpha)` rather than `T`.
+    fn regret_weight_total(&self) -> f32 {
+        self.regret_weight
     }
 }
 
@@ -177,5 +192,27 @@ mod tests {
         let weights = rm.best_weight();
         let sum: f32 = weights.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cumulative_regret_len() {
+        let mut rm = DiscountedRegretMatcher::new(4);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+
+        rm.update_regret(&[1.0, 0.0, -1.0, 0.5]);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+    }
+
+    #[test]
+    fn test_average_regret_zero_before_updates() {
+        let rm = DiscountedRegretMatcher::new(3);
+        assert_eq!(rm.average_regret(), 0.0);
+    }
+
+    #[test]
+    fn test_average_regret_positive_after_dominant_action() {
+        let mut rm = DiscountedRegretMatcher::new(3);
+        rm.update_regret(&[1.0, 0.0, -1.0]);
+        assert!(rm.average_regret() > 0.0);
     }
 }

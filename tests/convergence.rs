@@ -148,3 +148,56 @@ fn run_and_get_exploitability<M: RegretMinimizer>(iterations: usize) -> f32 {
 
     compute_exploitability(&runner.best_weight())
 }
+
+/// Average regret is the CFR convergence diagnostic: once normalized by each
+/// matcher's own regret weight it should shrink to a small value as the matcher
+/// approaches the RPS Nash equilibrium, regardless of the weighting scheme.
+fn assert_average_regret_converges<M: RegretMinimizer>(name: &str) {
+    let mut runner = RPSRunnerGeneric::<M>::new();
+    let mut rng = rand::rng();
+
+    for _ in 0..NUM_ITERATIONS {
+        runner.run_one(&mut rng);
+        runner.update_regret();
+    }
+
+    let ar = runner.matcher_one.average_regret();
+    assert!(ar >= 0.0, "{name}: average regret must be >= 0");
+    assert!(
+        ar < CONVERGENCE_TOLERANCE,
+        "{name}: average regret should be small after convergence, got {ar}"
+    );
+}
+
+#[test]
+fn test_average_regret_converges_cfr_plus() {
+    assert_average_regret_converges::<CfrPlusRegretMatcher>("CFR+");
+}
+
+#[test]
+fn test_average_regret_converges_dcfr() {
+    assert_average_regret_converges::<DiscountedRegretMatcher>("DCFR");
+}
+
+#[test]
+fn test_average_regret_converges_dcfr_plus() {
+    assert_average_regret_converges::<DcfrPlusRegretMatcher>("DCFR+");
+}
+
+// Regression guard: Linear CFR weights regret by `t`, so dividing by `T`
+// (the old behavior) left this growing without bound (~43 at T=10k). With the
+// correct `T(T+1)/2` normalizer it must converge like the other matchers.
+#[test]
+fn test_average_regret_converges_linear_cfr() {
+    assert_average_regret_converges::<LinearCfrRegretMatcher>("LinearCFR");
+}
+
+#[test]
+fn test_average_regret_converges_pcfr_plus() {
+    assert_average_regret_converges::<PcfrPlusRegretMatcher>("PCFR+");
+}
+
+#[test]
+fn test_average_regret_converges_pdcfr_plus() {
+    assert_average_regret_converges::<PdcfrPlusRegretMatcher>("PDCFR+");
+}

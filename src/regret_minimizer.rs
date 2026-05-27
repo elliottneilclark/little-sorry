@@ -11,11 +11,13 @@
 /// algorithms that rely on regret matching. The trait provides a common
 /// interface for different CFR variants.
 ///
-/// Only [`RegretMinimizer::new`], [`RegretMinimizer::update_regret`],
+/// [`RegretMinimizer::new`], [`RegretMinimizer::update_regret`],
 /// [`RegretMinimizer::num_updates`], [`RegretMinimizer::current_strategy`],
-/// and [`RegretMinimizer::cumulative_strategy`] need to be implemented.
-/// [`RegretMinimizer::next_action`] and [`RegretMinimizer::best_weight`]
-/// have default implementations.
+/// [`RegretMinimizer::cumulative_strategy`], and
+/// [`RegretMinimizer::cumulative_regret`] need to be implemented.
+/// [`RegretMinimizer::next_action`], [`RegretMinimizer::best_weight`],
+/// [`RegretMinimizer::regret_weight_total`], and
+/// [`RegretMinimizer::average_regret`] have default implementations.
 pub trait RegretMinimizer: Clone {
     /// Creates a new regret minimizer with the given number of actions/experts.
     ///
@@ -52,50 +54,101 @@ pub trait RegretMinimizer: Clone {
 
     /// Samples the next action according to the current strategy.
     fn next_action<R: rand::Rng>(&self, rng: &mut R) -> usize {
-        sample_action(self.current_strategy(), rng)
+        crate::probability::sample_action(self.current_strategy(), rng)
     }
 
     /// Returns the average strategy weights (Nash equilibrium approximation).
     #[must_use]
     fn best_weight(&self) -> Vec<f32> {
-        normalize_by_sum(self.cumulative_strategy())
+        crate::probability::normalize_by_sum(self.cumulative_strategy())
     }
-}
 
-/// Create a uniform probability distribution of length `n`.
-pub(crate) fn uniform_weights(n: usize) -> Vec<f32> {
-    vec![1.0 / n as f32; n]
-}
+    /// Per-action cumulative regret after the updates performed so far.
+    ///
+    /// Length equals the number of actions/experts. Values may be **signed**
+    /// (vanilla / discounted / linear CFR) or **non-negative** (CFR+ variants,
+    /// which floor at zero). Use [`RegretMinimizer::average_regret`]
+    /// for a convergence scalar that is well-defined regardless of sign
+    /// convention.
+    #[must_use]
+    fn cumulative_regret(&self) -> &[f32];
 
-/// Fill a slice with uniform probabilities.
-pub(crate) fn uniform_fill(p: &mut [f32]) {
-    let uniform = 1.0 / p.len() as f32;
-    p.fill(uniform);
-}
+    /// Total regret weight `Wᵀ` accumulated so far — the sum of the
+    /// per-iteration weights this matcher applies to instantaneous regret.
+    ///
+    /// This is the denominator used by [`RegretMinimizer::average_regret`] so
+    /// that the result is a true (weight-aware) time average. The default `T`
+    /// (= [`RegretMinimizer::num_updates`]) is correct for unweighted
+    /// accumulation (CFR+, PCFR+). Matchers that weight regret over time
+    /// override it: Linear CFR uses `T(T+1)/2`, and the discounted variants
+    /// track the discounted weight sum. Returns `0.0` before any update.
+    #[must_use]
+    fn regret_weight_total(&self) -> f32 {
+        self.num_updates() as f32
+    }
 
-/// Sample an action index from a probability distribution using cumulative sum.
-pub(crate) fn sample_action<R: rand::Rng>(p: &[f32], rng: &mut R) -> usize {
-    use rand::RngExt;
-    let r: f32 = rng.random();
-    let mut cumsum = 0.0;
-    for (i, &prob) in p.iter().enumerate() {
-        cumsum += prob;
-        if r < cumsum {
-            return i;
+    /// Average regret: `maxₐ [Rᵀ(a)]⁺ / Wᵀ`.
+    ///
+    /// The standard regret-minimization convergence diagnostic — the maximum
+    /// over actions of the (weight-aware) time-averaged regret, clamped to be
+    /// non-negative. It tends to `0` as the average strategy approaches a
+    /// (local) equilibrium, so a small value means the node has nearly stopped
+    /// gaining regret. The typical use is a stopping criterion: keep iterating
+    /// until it drops below a tolerance (see the example below).
+    ///
+    /// # Behavior
+    ///
+    /// - Always `>= 0`.
+    /// - Returns `0.0` before the first
+    ///   [`update_regret`](RegretMinimizer::update_regret) — and again whenever
+    ///   a matcher resets its accumulators (e.g. the CFR+ all-negative reset;
+    ///   see [`crate::CfrPlusRegretMatcher`]). A `0.0` reading means "no
+    ///   accumulated regret", which is **not** the same as "converged after
+    ///   many iterations". Gate any stopping check on a minimum
+    ///   [`num_updates`](RegretMinimizer::num_updates) so that a freshly
+    ///   created or just-reset matcher is not mistaken for a converged one.
+    /// - The averaging weight is
+    ///   [`regret_weight_total`](RegretMinimizer::regret_weight_total), which
+    ///   differs per matcher (`T` for CFR+/PCFR+, `T(T+1)/2` for Linear CFR, a
+    ///   discounted sum for the DCFR variants). Absolute magnitudes are
+    ///   therefore **not** comparable across matchers — pick the tolerance for
+    ///   the matcher you are actually using. The per-element positive part
+    ///   means both signed and clamped
+    ///   [`cumulative_regret`](RegretMinimizer::cumulative_regret) storage are
+    ///   handled correctly.
+    ///
+    /// # Examples
+    ///
+    /// Iterate until the average regret falls below a tolerance, but only after
+    /// a minimum number of updates so the initial `0.0` is not treated as
+    /// convergence:
+    ///
+    /// ```
+    /// use little_sorry::{DcfrPlusRegretMatcher, RegretMinimizer};
+    ///
+    /// let mut matcher = DcfrPlusRegretMatcher::new(3);
+    /// let tolerance = 0.01;
+    /// let min_iterations = 100;
+    ///
+    /// for t in 0..10_000 {
+    ///     matcher.update_regret(&[1.0, -0.5, 0.2]);
+    ///     if t >= min_iterations && matcher.average_regret() < tolerance {
+    ///         break;
+    ///     }
+    /// }
+    /// assert!(matcher.average_regret() >= 0.0);
+    /// ```
+    #[must_use]
+    fn average_regret(&self) -> f32 {
+        let w = self.regret_weight_total();
+        if w <= 0.0 {
+            return 0.0;
         }
-    }
-    p.len() - 1
-}
-
-/// Dot product of two slices.
-pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| x * y).sum()
-}
-
-/// dst[i] += src[i]
-pub(crate) fn add_assign(dst: &mut [f32], src: &[f32]) {
-    for (d, &s) in dst.iter_mut().zip(src) {
-        *d += s;
+        let max_pos = self
+            .cumulative_regret()
+            .iter()
+            .fold(0.0_f32, |m, &r| m.max(r.max(0.0)));
+        max_pos / w
     }
 }
 
@@ -105,127 +158,12 @@ pub(crate) fn regret_match(regrets: &[f32], p: &mut [f32]) {
     for (pi, &r) in p.iter_mut().zip(regrets) {
         *pi = r.max(0.0);
     }
-    normalize_inplace(p);
-}
-
-/// Normalize non-negative values in `p` to sum to 1.
-/// Falls back to uniform if sum is zero.
-pub(crate) fn normalize_inplace(p: &mut [f32]) {
-    let sum: f32 = p.iter().sum();
-    if sum <= 0.0 {
-        uniform_fill(p);
-    } else {
-        let inv = 1.0 / sum;
-        for pi in p.iter_mut() {
-            *pi *= inv;
-        }
-    }
-}
-
-/// Normalize a slice by its sum, returning a new Vec.
-/// Falls back to uniform if sum is zero.
-pub(crate) fn normalize_by_sum(sum_p: &[f32]) -> Vec<f32> {
-    let sum: f32 = sum_p.iter().sum();
-    if sum <= 0.0 {
-        uniform_weights(sum_p.len())
-    } else {
-        let inv = 1.0 / sum;
-        sum_p.iter().map(|&v| v * inv).collect()
-    }
+    crate::probability::normalize_inplace(p);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── uniform_weights ─────────────────────────────────────────────
-
-    #[test]
-    fn test_uniform_weights_sums_to_one() {
-        for n in 1..=10 {
-            let w = uniform_weights(n);
-            assert_eq!(w.len(), n);
-            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn test_uniform_weights_all_equal() {
-        let w = uniform_weights(4);
-        assert!(w.iter().all(|&v| (v - 0.25).abs() < 1e-6));
-    }
-
-    // ── uniform_fill ────────────────────────────────────────────────
-
-    #[test]
-    fn test_uniform_fill() {
-        let mut p = vec![0.0; 5];
-        uniform_fill(&mut p);
-        assert!(p.iter().all(|&v| (v - 0.2).abs() < 1e-6));
-        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-    }
-
-    // ── dot ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_dot_basic() {
-        assert!((dot(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]) - 32.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dot_zeros() {
-        assert!((dot(&[0.0, 0.0], &[1.0, 2.0])).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_dot_single() {
-        assert!((dot(&[3.0], &[7.0]) - 21.0).abs() < 1e-6);
-    }
-
-    // ── add_assign ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_add_assign() {
-        let mut dst = vec![1.0, 2.0, 3.0];
-        add_assign(&mut dst, &[10.0, 20.0, 30.0]);
-        assert!((dst[0] - 11.0).abs() < 1e-6);
-        assert!((dst[1] - 22.0).abs() < 1e-6);
-        assert!((dst[2] - 33.0).abs() < 1e-6);
-    }
-
-    // ── normalize_inplace ───────────────────────────────────────────
-
-    #[test]
-    fn test_normalize_inplace_positive() {
-        let mut p = vec![2.0, 3.0, 5.0];
-        normalize_inplace(&mut p);
-        assert!((p[0] - 0.2).abs() < 1e-6);
-        assert!((p[1] - 0.3).abs() < 1e-6);
-        assert!((p[2] - 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_normalize_inplace_all_zeros_falls_back_to_uniform() {
-        let mut p = vec![0.0, 0.0, 0.0];
-        normalize_inplace(&mut p);
-        let expected = 1.0 / 3.0;
-        assert!(p.iter().all(|&v| (v - expected).abs() < 1e-6));
-    }
-
-    // ── normalize_by_sum ────────────────────────────────────────────
-
-    #[test]
-    fn test_normalize_by_sum_positive() {
-        let result = normalize_by_sum(&[1.0, 3.0]);
-        assert!((result[0] - 0.25).abs() < 1e-6);
-        assert!((result[1] - 0.75).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_normalize_by_sum_zeros_falls_back_to_uniform() {
-        let result = normalize_by_sum(&[0.0, 0.0, 0.0, 0.0]);
-        assert!(result.iter().all(|&v| (v - 0.25).abs() < 1e-6));
-    }
 
     // ── regret_match ────────────────────────────────────────────────
 
@@ -258,26 +196,49 @@ mod tests {
         assert!((p[2] - 0.7).abs() < 1e-6);
     }
 
-    // ── sample_action ───────────────────────────────────────────────
+    // ── average_regret default ──────────────────────────────────────
 
-    #[test]
-    fn test_sample_action_deterministic_distribution() {
-        let mut rng = rand::rng();
-        // All weight on action 2
-        let p = [0.0, 0.0, 1.0];
-        for _ in 0..100 {
-            assert_eq!(sample_action(&p, &mut rng), 2);
-        }
+    /// The provided `average_regret` default must equal
+    /// `max(0, max cumulative_regret) / regret_weight_total` for any
+    /// implementor.
+    fn assert_default_formula<M: RegretMinimizer>(m: &M) {
+        let w = m.regret_weight_total();
+        let expected = if w <= 0.0 {
+            0.0
+        } else {
+            m.cumulative_regret()
+                .iter()
+                .fold(0.0_f32, |acc, &r| acc.max(r.max(0.0)))
+                / w
+        };
+        assert!(
+            (m.average_regret() - expected).abs() < 1e-6,
+            "average_regret {} != formula {}",
+            m.average_regret(),
+            expected
+        );
     }
 
     #[test]
-    fn test_sample_action_uniform_hits_all_actions() {
-        let mut rng = rand::rng();
-        let p = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
-        let mut seen = [false; 3];
-        for _ in 0..500 {
-            seen[sample_action(&p, &mut rng)] = true;
+    fn test_average_regret_matches_formula() {
+        use crate::{DiscountedRegretMatcher, PcfrPlusRegretMatcher};
+
+        // Before any update: the W == 0 guard yields 0.0.
+        let mut m = PcfrPlusRegretMatcher::new(3);
+        assert_eq!(m.average_regret(), 0.0);
+        assert_default_formula(&m);
+
+        // After a known update from uniform: regret = [2, 0, 0], W = T = 1.
+        m.update_regret(&[3.0, 0.0, 0.0]);
+        assert!((m.average_regret() - 2.0).abs() < 1e-6);
+        assert_default_formula(&m);
+
+        // A discounted matcher normalizes by its tracked discount weight, not
+        // T; average_regret must still equal the documented formula over it.
+        let mut d = DiscountedRegretMatcher::new(3);
+        for _ in 0..5 {
+            d.update_regret(&[1.0, 0.0, -1.0]);
         }
-        assert!(seen.iter().all(|&s| s), "expected all actions sampled");
+        assert_default_formula(&d);
     }
 }

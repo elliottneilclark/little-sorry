@@ -8,6 +8,7 @@
 //! (arXiv:2404.13891)
 
 use crate::regret_minimizer::{self, RegretMinimizer};
+use crate::{probability, vector_ops};
 
 /// A regret matcher implementing Linear CFR.
 ///
@@ -29,7 +30,7 @@ pub struct LinearCfrRegretMatcher {
 
 impl RegretMinimizer for LinearCfrRegretMatcher {
     fn new(num_experts: usize) -> Self {
-        let p = regret_minimizer::uniform_weights(num_experts);
+        let p = probability::uniform_weights(num_experts);
         Self {
             p,
             sum_p: vec![0.0; num_experts],
@@ -41,7 +42,7 @@ impl RegretMinimizer for LinearCfrRegretMatcher {
     fn update_regret(&mut self, rewards: &[f32]) {
         let t = (self.num_updates + 1) as f32;
 
-        let expected = regret_minimizer::dot(&self.p, rewards);
+        let expected = vector_ops::dot(&self.p, rewards);
 
         // Linear CFR: R^t = R^{t-1} + t * r^t
         for (cr, &rw) in self.cumulative_regret.iter_mut().zip(rewards) {
@@ -51,9 +52,7 @@ impl RegretMinimizer for LinearCfrRegretMatcher {
         regret_minimizer::regret_match(&self.cumulative_regret, &mut self.p);
 
         // Linear weighting: X^t = X^{t-1} + t * x^t
-        for (sp, &pi) in self.sum_p.iter_mut().zip(self.p.iter()) {
-            *sp += t * pi;
-        }
+        vector_ops::scaled_add_assign(&mut self.sum_p, t, &self.p);
         self.num_updates += 1;
     }
 
@@ -67,6 +66,17 @@ impl RegretMinimizer for LinearCfrRegretMatcher {
 
     fn cumulative_strategy(&self) -> &[f32] {
         &self.sum_p
+    }
+
+    fn cumulative_regret(&self) -> &[f32] {
+        &self.cumulative_regret
+    }
+
+    /// Linear CFR weights iteration `t`'s regret by `t`, so the total weight
+    /// after `T` updates is `Σ_{t=1}^{T} t = T(T+1)/2`.
+    fn regret_weight_total(&self) -> f32 {
+        let t = self.num_updates as f32;
+        t * (t + 1.0) / 2.0
     }
 }
 
@@ -110,5 +120,45 @@ mod tests {
 
         rm.update_regret(&[1.0, 0.0, -1.0]);
         assert_eq!(rm.num_updates(), 1);
+    }
+
+    #[test]
+    fn test_cumulative_regret_len() {
+        let mut rm = LinearCfrRegretMatcher::new(4);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+
+        rm.update_regret(&[1.0, 0.0, -1.0, 0.5]);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+    }
+
+    #[test]
+    fn test_average_regret_zero_before_updates() {
+        let rm = LinearCfrRegretMatcher::new(3);
+        assert_eq!(rm.average_regret(), 0.0);
+    }
+
+    #[test]
+    fn test_average_regret_positive_after_dominant_action() {
+        let mut rm = LinearCfrRegretMatcher::new(3);
+        rm.update_regret(&[1.0, 0.0, -1.0]);
+        assert!(rm.average_regret() > 0.0);
+    }
+
+    #[test]
+    fn test_average_regret_normalizes_by_linear_weight() {
+        let mut rm = LinearCfrRegretMatcher::new(3);
+
+        // Update 1 (t=1) from uniform: expected = 0, inst = [1, 0, -1],
+        // R = 1*inst = [1, 0, -1]. Weight total W = 1.
+        // average_regret = max(0, max R) / W = 1.0 / 1.
+        rm.update_regret(&[1.0, 0.0, -1.0]);
+        assert!((rm.average_regret() - 1.0).abs() < 1e-6);
+
+        // After update 1, regret matching gives strategy [1, 0, 0].
+        // Update 2 (t=2): expected = dot([1,0,0], [1,0,-1]) = 1.0,
+        // inst = [0, -1, -2], R += 2*inst = [1, -2, -5]. max positive = 1.
+        // Weight total W = 1 + 2 = 3, so average_regret = 1/3.
+        rm.update_regret(&[1.0, 0.0, -1.0]);
+        assert!((rm.average_regret() - 1.0 / 3.0).abs() < 1e-6);
     }
 }

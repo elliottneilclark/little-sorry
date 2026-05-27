@@ -8,7 +8,8 @@
 //! (arXiv:2404.13891)
 
 use crate::discount::DiscountParams;
-use crate::regret_minimizer::{self, RegretMinimizer};
+use crate::regret_minimizer::RegretMinimizer;
+use crate::{probability, vector_ops};
 
 /// A regret matcher implementing PDCFR+ (Predictive Discounted CFR+).
 ///
@@ -33,6 +34,7 @@ pub struct PdcfrPlusRegretMatcher {
     sum_p: Vec<f32>,
     cumulative_regret: Vec<f32>,
     last_instantaneous_regret: Vec<f32>,
+    regret_weight: f32,
     num_updates: usize,
 }
 
@@ -44,7 +46,7 @@ impl PdcfrPlusRegretMatcher {
     /// Panics if `num_experts` is 0.
     #[must_use]
     pub fn new_with_params(num_experts: usize, alpha: f32, gamma: f32) -> Self {
-        let p = regret_minimizer::uniform_weights(num_experts);
+        let p = probability::uniform_weights(num_experts);
         Self {
             alpha,
             gamma,
@@ -52,6 +54,7 @@ impl PdcfrPlusRegretMatcher {
             sum_p: vec![0.0; num_experts],
             cumulative_regret: vec![0.0; num_experts],
             last_instantaneous_regret: vec![0.0; num_experts],
+            regret_weight: 0.0,
             num_updates: 0,
         }
     }
@@ -97,7 +100,7 @@ impl RegretMinimizer for PdcfrPlusRegretMatcher {
             0.0
         };
 
-        let expected = regret_minimizer::dot(&self.p, rewards);
+        let expected = vector_ops::dot(&self.p, rewards);
 
         // DCFR+ regret update + store instantaneous for prediction
         for ((cr, lr), &rw) in self
@@ -120,12 +123,14 @@ impl RegretMinimizer for PdcfrPlusRegretMatcher {
         {
             *pi = (cr * curr_discount + lr).max(0.0);
         }
-        regret_minimizer::normalize_inplace(&mut self.p);
+        probability::normalize_inplace(&mut self.p);
+
+        // Track the discounted regret-weight sum `W^t = W^{t-1} * d + 1`,
+        // mirroring the discount applied to the accumulator this step.
+        self.regret_weight = self.regret_weight * prev_discount + 1.0;
 
         // Discounted cumulative strategy
-        for (sp, &pi) in self.sum_p.iter_mut().zip(self.p.iter()) {
-            *sp = *sp * strategy_discount + pi;
-        }
+        vector_ops::discounted_accumulate(&mut self.sum_p, strategy_discount, &self.p);
         self.num_updates += 1;
     }
 
@@ -139,6 +144,16 @@ impl RegretMinimizer for PdcfrPlusRegretMatcher {
 
     fn cumulative_strategy(&self) -> &[f32] {
         &self.sum_p
+    }
+
+    /// PDCFR+ discounts older regret, so the weight total is the tracked
+    /// discounted sum rather than `T`.
+    fn regret_weight_total(&self) -> f32 {
+        self.regret_weight
+    }
+
+    fn cumulative_regret(&self) -> &[f32] {
+        &self.cumulative_regret
     }
 }
 
@@ -191,5 +206,27 @@ mod tests {
 
         rm.update_regret(&[1.0, 0.0, -1.0]);
         assert_eq!(rm.num_updates(), 1);
+    }
+
+    #[test]
+    fn test_cumulative_regret_len() {
+        let mut rm = PdcfrPlusRegretMatcher::new(4);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+
+        rm.update_regret(&[1.0, 0.0, -1.0, 0.5]);
+        assert_eq!(rm.cumulative_regret().len(), 4);
+    }
+
+    #[test]
+    fn test_average_regret_zero_before_updates() {
+        let rm = PdcfrPlusRegretMatcher::new(3);
+        assert_eq!(rm.average_regret(), 0.0);
+    }
+
+    #[test]
+    fn test_average_regret_positive_after_dominant_action() {
+        let mut rm = PdcfrPlusRegretMatcher::new(3);
+        rm.update_regret(&[1.0, 0.0, -1.0]);
+        assert!(rm.average_regret() > 0.0);
     }
 }

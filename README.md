@@ -14,6 +14,12 @@ A Rust library for regret minimization algorithms (Counterfactual Regret Minimiz
 - Zero-allocation hot path — no heap allocations during `update_regret`
 - Minimal dependencies (`rand` only)
 - Rock-Paper-Scissors example game (feature-gated behind `rps`)
+- **Batched, storage-generic matchers** for large and concurrent solves —
+  `BatchedMatcher<Rule, Backend>` owns many information sets on one shared
+  iteration clock, generic over the update rule and over a single-threaded or
+  lock-free atomic cell backend
+- **Compact strategy export** — dependency-free fixed-point quantization of a
+  solved average strategy (`quantize_dist` / `dequantize_dist`)
 
 ## Getting Started
 
@@ -52,6 +58,38 @@ fn train<M: RegretMinimizer>(matcher: &mut M, iterations: usize) {
         matcher.update_regret(rewards);
     }
 }
+```
+
+### Scaling up: batched matchers and strategy export
+
+For abstraction-based or multi-threaded solvers, `BatchedMatcher` owns many
+information sets ("rows") that advance together, so per-iteration discount
+factors are computed once per visit instead of once per row. The update rule and
+the storage backend are each one type parameter: pick `Local` for a
+zero-overhead single-threaded solve or `Atomic` to update a shared matcher
+lock-free from many threads. The solved average strategy reads out identically
+for every rule and can be exported to compact fixed-point codes.
+
+```rust
+use little_sorry::{BatchedMatcher, Dcfr, DiscountParams, Local};
+use little_sorry::{dequantize_dist, quantize_dist};
+
+// One node owning 8 abstraction classes over 3 actions, using DCFR on the
+// single-threaded backend. Swap `Dcfr` for `PdcfrPlus`, or `Local` for
+// `Atomic`, with no other changes.
+let node = BatchedMatcher::<Dcfr, Local>::new(8, 3, DiscountParams::RECOMMENDED);
+
+let mut expected = [0.0; 8];
+for _ in 0..1000 {
+    node.update_batch(|action, _row| [1.0, -0.5, 0.2][action], &mut expected);
+}
+
+// Export row 0's average strategy compactly, then reload it.
+let mut probs = [0.0; 3];
+node.average_into(0, &mut probs);
+let codes: Vec<u16> = quantize_dist(&probs);
+let reloaded = dequantize_dist::<u16>(&codes); // decodes and renormalizes
+assert!((reloaded.iter().sum::<f32>() - 1.0).abs() < 1e-6);
 ```
 
 ## Building and Testing

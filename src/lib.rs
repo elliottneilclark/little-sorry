@@ -29,7 +29,40 @@
 //! let strategy = matcher.best_weight();
 //! assert!((strategy.iter().sum::<f32>() - 1.0).abs() < 1e-6);
 //! ```
+//!
+//! ## Batched, storage-generic matchers
+//!
+//! For large or concurrent solves, [`BatchedMatcher`] owns many information sets
+//! ("rows") that advance on one shared iteration clock, so a rule's
+//! time-dependent factors are computed once per batch rather than once per row.
+//! It is generic over both the update rule (one of [`Dcfr`], [`DcfrPlus`],
+//! [`LinearCfr`], [`PcfrPlus`], [`PdcfrPlus`]) and the cell backend ([`Local`]
+//! for zero-overhead single-threaded use, [`Atomic`] for lock-free concurrent
+//! updates through a shared reference). Swapping either is a one-type change.
+//!
+//! The solved average strategy reads out the same way for every rule and can be
+//! exported compactly with [`quantize_dist`] / [`dequantize_dist`]:
+//!
+//! ```
+//! use little_sorry::{BatchedMatcher, Dcfr, DiscountParams, Local};
+//! use little_sorry::{dequantize_dist, quantize_dist};
+//!
+//! // One node owning 8 abstraction classes over 3 actions.
+//! let node = BatchedMatcher::<Dcfr, Local>::new(8, 3, DiscountParams::RECOMMENDED);
+//! let mut expected = [0.0; 8];
+//! for _ in 0..1000 {
+//!     // The caller supplies values from whatever layout it holds.
+//!     node.update_batch(|action, _row| [1.0, -0.5, 0.2][action], &mut expected);
+//! }
+//!
+//! let mut probs = [0.0; 3];
+//! node.average_into(0, &mut probs); // normalized average strategy, any rule
+//! let codes = quantize_dist::<u16>(&probs); // compact on-disk form
+//! let reloaded = dequantize_dist::<u16>(&codes); // decodes AND renormalizes
+//! assert!((reloaded.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+//! ```
 
+pub mod batched_matcher;
 pub mod cfr_plus;
 pub mod dcfr;
 pub mod dcfr_plus;
@@ -37,7 +70,11 @@ pub mod discount;
 pub mod linear_cfr;
 pub mod pcfr_plus;
 pub mod pdcfr_plus;
+pub mod quantize;
 pub mod regret_minimizer;
+pub mod rules;
+pub mod storage;
+pub mod update_rule;
 
 mod probability;
 mod vector_ops;
@@ -53,6 +90,13 @@ pub use linear_cfr::LinearCfrRegretMatcher;
 pub use pcfr_plus::PcfrPlusRegretMatcher;
 pub use pdcfr_plus::PdcfrPlusRegretMatcher;
 pub use regret_minimizer::RegretMinimizer;
+
+// Batched, storage-generic machinery.
+pub use batched_matcher::BatchedMatcher;
+pub use quantize::{FixedWidth, dequantize_dist, quantize_dist};
+pub use rules::{Dcfr, DcfrPlus, LinearCfr, PcfrPlus, PdcfrPlus, PlusDiscount};
+pub use storage::{Atomic, Local};
+pub use update_rule::UpdateRule;
 
 // Re-export for backwards compatibility
 pub use cfr_plus::CfrPlusRegretMatcher as RegretMatcher;

@@ -61,12 +61,26 @@
 //! let reloaded = dequantize_dist::<u16>(&codes); // decodes AND renormalizes
 //! assert!((reloaded.iter().sum::<f32>() - 1.0).abs() < 1e-6);
 //! ```
+//!
+//! The memory layout is a third type parameter (`F32Full` by default). Swap it
+//! to cut footprint without changing the API:
+//!
+//! ```
+//! use little_sorry::{BatchedMatcher, Dcfr, DiscountParams, Local, HalfStrategy};
+//! // f32 regret + u16 average strategy — ~25% smaller, same f32-facing API.
+//! let node = BatchedMatcher::<Dcfr, Local, HalfStrategy>::new(8, 3, DiscountParams::RECOMMENDED);
+//! node.seed(|action, _row| [10.0, 0.0, 0.0][action], 100); // warm-start row regret
+//! let mut probs = [0.0; 3];
+//! node.average_into(0, &mut probs);
+//! assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+//! ```
 
 pub mod batched_matcher;
 pub mod cfr_plus;
 pub mod dcfr;
 pub mod dcfr_plus;
 pub mod discount;
+pub mod lane;
 pub mod linear_cfr;
 pub mod pcfr_plus;
 pub mod pdcfr_plus;
@@ -77,6 +91,8 @@ pub mod storage;
 pub mod update_rule;
 
 mod probability;
+mod scaled_int;
+mod unit_fixed;
 mod vector_ops;
 
 #[cfg(feature = "rps")]
@@ -93,6 +109,12 @@ pub use regret_minimizer::RegretMinimizer;
 
 // Batched, storage-generic machinery.
 pub use batched_matcher::BatchedMatcher;
+// Memory layout types.
+pub use lane::{
+    F32Full, F32Regret, F32SumStrategy, HalfBoth, HalfBothShared, HalfRegret, HalfStrategy,
+    HalfStrategyShared, Int16Regret, Layout, RegretLane, StrategyLane, U16AvgStrategy,
+    U16AvgStrategyShared,
+};
 pub use quantize::{FixedWidth, dequantize_dist, quantize_dist};
 pub use rules::{Dcfr, DcfrPlus, LinearCfr, PcfrPlus, PdcfrPlus, PlusDiscount};
 pub use storage::{Atomic, Local};

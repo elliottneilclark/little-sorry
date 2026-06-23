@@ -1,8 +1,10 @@
 //! A matcher owning many information sets over a pluggable cell backend.
 //!
 //! One instance holds `num_rows` information sets ("rows"), each over the same
-//! `num_actions`, laid out as a single flat array of cells addressed
-//! `[row][lane][action]` (lanes per [`crate::update_rule`]). All rows share one
+//! `num_actions`, with cumulative regret and cumulative strategy held in
+//! pluggable lane stores (a [`crate::lane::Layout`]) rather than a single flat
+//! cell array. Predictive rules additionally own a matcher-side
+//! last-instantaneous-regret lane (always f32). All rows share one
 //! iteration clock: a single batched update advances the clock once and touches
 //! every row, so the time-dependent factors a rule needs are computed once for
 //! the whole batch rather than once per row — the win that makes a decision
@@ -21,7 +23,8 @@
 //! which is what makes a batch-size-1 matcher match its scalar counterpart
 //! bit-for-bit.
 
-use crate::storage::{CounterCell, FloatCell, StorageBackend};
+use crate::lane::{F32Full, Layout, RegretLane, StrategyLane};
+use crate::storage::{AccumCell, CounterCell, StorageBackend};
 use crate::update_rule::UpdateRule;
 use std::marker::PhantomData;
 
@@ -46,28 +49,27 @@ impl Scratch {
     }
 }
 
-/// A batched regret matcher generic over the update rule `R` and the storage
-/// backend `B`.
-pub struct BatchedMatcher<R: UpdateRule, B: StorageBackend> {
+/// A batched regret matcher generic over the update rule `R`, the storage
+/// backend `B`, and the memory layout `L` (which lane stores hold cumulative
+/// regret and cumulative strategy). `L` defaults to [`F32Full`], reproducing
+/// the previous all-f32 behavior, so `BatchedMatcher::<R, B>` keeps working.
+pub struct BatchedMatcher<R: UpdateRule, B: StorageBackend, L: Layout<R, B> = F32Full> {
     params: R::Params,
     num_rows: usize,
     num_actions: usize,
-    row_stride: usize,
-    cells: Vec<B::Float>,
+    regret: L::Regret,
+    strategy: L::Strategy,
+    /// Last-instantaneous-regret lane for predictive rules, stored as f32 bits.
+    /// Empty for non-predictive rules (`R::LANES <= 2`).
+    last_inst: Vec<B::Cell<u32>>,
     counter: B::Counter,
     /// Shared regret-weight accumulator for the average-regret diagnostic; one
-    /// scalar for the whole batch, advanced once per tick.
-    regret_weight: B::Float,
+    /// scalar (f32 bits) for the whole batch, advanced once per tick.
+    regret_weight: B::Cell<u32>,
     _rule: PhantomData<R>,
 }
 
-impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
-    /// Lane indices. Lane 0 holds cumulative regret, lane 1 cumulative strategy,
-    /// and (predictive rules) lane 2 the last instantaneous regret.
-    const REGRET: usize = 0;
-    const STRATEGY: usize = 1;
-    const LAST_INST: usize = 2;
-
+impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> {
     /// Create a matcher of `num_rows` information sets over `num_actions`
     /// actions. All accumulators start at zero, so every row reads as the
     /// uniform strategy until updated.
@@ -79,20 +81,41 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
     pub fn new(num_rows: usize, num_actions: usize, params: R::Params) -> Self {
         assert!(num_rows > 0, "num_rows must be > 0");
         assert!(num_actions > 0, "num_actions must be > 0");
-        let row_stride = R::LANES * num_actions;
-        let cells = (0..num_rows * row_stride)
-            .map(|_| B::Float::default())
-            .collect();
+        let last_inst = if R::LANES > 2 {
+            (0..num_rows * num_actions)
+                .map(|_| B::Cell::<u32>::default())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             params,
             num_rows,
             num_actions,
-            row_stride,
-            cells,
+            regret: L::Regret::new(num_rows, num_actions),
+            strategy: L::Strategy::new(num_rows, num_actions),
+            last_inst,
             counter: B::Counter::default(),
-            regret_weight: B::Float::default(),
+            regret_weight: B::Cell::<u32>::default(),
             _rule: PhantomData,
         }
+    }
+
+    #[inline]
+    fn li_load(&self, idx: usize) -> f32 {
+        f32::from_bits(self.last_inst[idx].load())
+    }
+    #[inline]
+    fn li_store(&self, idx: usize, v: f32) {
+        self.last_inst[idx].store(v.to_bits());
+    }
+    #[inline]
+    fn rw_load(&self) -> f32 {
+        f32::from_bits(self.regret_weight.load())
+    }
+    #[inline]
+    fn rw_store(&self, v: f32) {
+        self.regret_weight.store(v.to_bits());
     }
 
     /// Number of information sets.
@@ -113,11 +136,6 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
         self.counter.load()
     }
 
-    #[inline]
-    fn cell(&self, row: usize, lane: usize, action: usize) -> &B::Float {
-        &self.cells[row * self.row_stride + lane * self.num_actions + action]
-    }
-
     /// Advance the shared clock by one tick and compute the rule's per-iteration
     /// constants once for the resulting iteration.
     fn tick(&self) -> R::Step {
@@ -127,8 +145,7 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
 
     /// Apply this tick's regret-weight recurrence to the shared accumulator.
     fn advance_weight(&self, step: &R::Step) {
-        self.regret_weight
-            .store(R::regret_weight_step(step, self.regret_weight.load()));
+        self.rw_store(R::regret_weight_step(step, self.rw_load()));
     }
 
     /// Update one row against a precomputed step, returning the row's expected
@@ -142,14 +159,14 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
         s: &mut Scratch,
     ) -> f32 {
         let a = self.num_actions;
-        let predictive = R::LANES > Self::LAST_INST;
+        let predictive = R::LANES > 2;
 
         // Snapshot the lanes we read, and cache the rewards so the value
         // accessor is called exactly once per action.
+        self.regret.read_row(row, a, &mut s.regret);
         for i in 0..a {
-            s.regret[i] = self.cell(row, Self::REGRET, i).load();
             if predictive {
-                s.last_inst[i] = self.cell(row, Self::LAST_INST, i).load();
+                s.last_inst[i] = self.li_load(row * a + i);
             }
             s.reward[i] = value(i);
         }
@@ -169,15 +186,14 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
         // Per-cell regret update; predictive rules also store the fresh
         // instantaneous regret for next tick's prediction.
         for i in 0..a {
-            let new_r = R::accumulate_regret(step, s.regret[i], s.reward[i], expected);
-            self.cell(row, Self::REGRET, i).store(new_r);
-            s.regret[i] = new_r;
+            s.regret[i] = R::accumulate_regret(step, s.regret[i], s.reward[i], expected);
             if predictive {
                 let inst = s.reward[i] - expected;
-                self.cell(row, Self::LAST_INST, i).store(inst);
+                self.li_store(row * a + i, inst);
                 s.last_inst[i] = inst;
             }
         }
+        self.regret.write_row(row, a, &s.regret);
 
         // The strategy this tick plays (and accumulates) is derived from the
         // updated lanes, then folded into the cumulative-strategy lane.
@@ -188,11 +204,7 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
             R::post_discount(step),
             &mut s.strategy,
         );
-        let (discount, weight) = R::strategy_accumulation(step);
-        for i in 0..a {
-            let cell = self.cell(row, Self::STRATEGY, i);
-            cell.store(cell.load() * discount + weight * s.strategy[i]);
-        }
+        self.strategy.accumulate(row, a, step, &s.strategy);
 
         expected
     }
@@ -234,6 +246,37 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
         ev
     }
 
+    /// Zeros the average (cumulative-strategy) lane and its per-row weights;
+    /// leaves cumulative regret, current strategy, and the clock untouched.
+    /// Pair with `seed` for a clean warm start where the target drives only the
+    /// current strategy and the exported average is rebuilt from re-equilibrated
+    /// play. The regret-based diagnostics (`average_regret`) are intentionally
+    /// preserved: `reset_average` zeros the average *strategy* lane only, not the
+    /// cumulative regret or its weight accumulator.
+    pub fn reset_average(&self) {
+        self.strategy.reset();
+    }
+
+    /// Overwrite every row's cumulative-regret lane from `regret(action, row)` and
+    /// set the shared iteration clock to `t0`, so the regret-matched `current_into`
+    /// starts at a warm-started target and subsequent discounting behaves as if
+    /// `t0` iterations had run. The strategy and last-instantaneous lanes are left
+    /// untouched; the average builds from later iterations.
+    ///
+    /// Diagnostic note: for discounted rules the `average_regret` baseline is not
+    /// reconstructed across a seed — treat it as a fresh diagnostic afterwards.
+    pub fn seed(&self, regret: impl Fn(usize, usize) -> f32, t0: usize) {
+        let a = self.num_actions;
+        let mut row_buf = vec![0.0f32; a];
+        for row in 0..self.num_rows {
+            for (i, slot) in row_buf.iter_mut().enumerate() {
+                *slot = regret(i, row);
+            }
+            self.regret.write_row(row, a, &row_buf);
+        }
+        self.counter.store(t0);
+    }
+
     /// Write a row's current strategy (the distribution it would play next) into
     /// `out`. Equal to what a stored-strategy matcher would hold.
     ///
@@ -246,13 +289,13 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
         let out = &mut out[..self.num_actions];
         let t = self.num_updates();
         let step = R::step(&self.params, t);
-        let predictive = R::LANES > Self::LAST_INST;
+        let predictive = R::LANES > 2;
         let mut regret = vec![0.0; self.num_actions];
         let mut last_inst = vec![0.0; self.num_actions];
-        for i in 0..self.num_actions {
-            regret[i] = self.cell(row, Self::REGRET, i).load();
-            if predictive {
-                last_inst[i] = self.cell(row, Self::LAST_INST, i).load();
+        self.regret.read_row(row, self.num_actions, &mut regret);
+        if predictive {
+            for (i, slot) in last_inst.iter_mut().enumerate() {
+                *slot = self.li_load(row * self.num_actions + i);
             }
         }
         R::strategy_from_lanes(
@@ -274,11 +317,7 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
     pub fn average_into(&self, row: usize, out: &mut [f32]) {
         assert!(row < self.num_rows, "row out of range");
         assert!(out.len() >= self.num_actions, "out too short");
-        let out = &mut out[..self.num_actions];
-        for (i, slot) in out.iter_mut().enumerate() {
-            *slot = self.cell(row, Self::STRATEGY, i).load();
-        }
-        crate::probability::normalize_inplace(out);
+        self.strategy.average_into(row, self.num_actions, out);
     }
 
     /// The average-regret convergence diagnostic for a row: the maximum positive
@@ -291,13 +330,13 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
     #[must_use]
     pub fn average_regret(&self, row: usize) -> f32 {
         assert!(row < self.num_rows, "row out of range");
-        let w = R::regret_weight_total(&self.params, self.num_updates(), self.regret_weight.load());
+        let w = R::regret_weight_total(&self.params, self.num_updates(), self.rw_load());
         if w <= 0.0 {
             return 0.0;
         }
-        let max_pos = (0..self.num_actions).fold(0.0_f32, |m, i| {
-            m.max(self.cell(row, Self::REGRET, i).load().max(0.0))
-        });
+        let mut regret = vec![0.0; self.num_actions];
+        self.regret.read_row(row, self.num_actions, &mut regret);
+        let max_pos = regret.iter().fold(0.0_f32, |m, &r| m.max(r.max(0.0)));
         max_pos / w
     }
 }
@@ -307,15 +346,17 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
     /// Raw cumulative-regret lane for a row (test-only; the public surface
     /// exposes derived strategies, not raw accumulators).
     fn raw_regret(&self, row: usize) -> Vec<f32> {
-        (0..self.num_actions)
-            .map(|i| self.cell(row, Self::REGRET, i).load())
-            .collect()
+        let mut v = vec![0.0; self.num_actions];
+        self.regret.read_row(row, self.num_actions, &mut v);
+        v
     }
 
-    /// Raw cumulative-strategy lane for a row (test-only).
+    /// Raw cumulative-strategy lane for a row (test-only). `F32SumStrategy`
+    /// stores the un-normalized sum; expose it for the golden bit-test, which
+    /// compares against the scalar matcher's `cumulative_strategy()`.
     fn raw_strategy(&self, row: usize) -> Vec<f32> {
         (0..self.num_actions)
-            .map(|i| self.cell(row, Self::STRATEGY, i).load())
+            .map(|i| self.strategy.strategy_raw_cell(row, i, self.num_actions))
             .collect()
     }
 }
@@ -487,4 +528,103 @@ mod tests {
         DcfrPlusRegretMatcher, DiscountedRegretMatcher, LinearCfrRegretMatcher,
         PcfrPlusRegretMatcher, PdcfrPlusRegretMatcher,
     };
+
+    #[test]
+    fn seed_from_own_regret_is_noop_on_current() {
+        use crate::storage::Local;
+        let m = BatchedMatcher::<Dcfr, Local>::new(2, 3, DiscountParams::RECOMMENDED);
+        let mut ev = [0.0f32; 2];
+        for _ in 0..10 {
+            m.update_batch(|a, _| [1.0, -0.5, 0.2][a], &mut ev);
+        }
+        let mut before = [0.0f32; 3];
+        m.current_into(1, &mut before);
+        let t = m.num_updates();
+        let snaps: Vec<Vec<f32>> = (0..2).map(|r| m.raw_regret(r)).collect();
+        m.seed(|a, row| snaps[row][a], t);
+        let mut after = [0.0f32; 3];
+        m.current_into(1, &mut after);
+        for (x, y) in before.iter().zip(&after) {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "seed from own regret must be a no-op"
+            );
+        }
+        assert_eq!(m.num_updates(), t);
+    }
+
+    #[test]
+    fn seed_positive_regret_reproduces_target_current_strategy() {
+        use crate::storage::Local;
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
+        let target = [0.2f32, 0.3, 0.5];
+        // Positive regret proportional to the target → regret-matching normalizes to it.
+        m.seed(|a, _row| 100.0 * target[a], 50);
+        let mut out = [0.0f32; 3];
+        m.current_into(0, &mut out);
+        for (a, b) in target.iter().zip(&out) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+        assert_eq!(m.num_updates(), 50);
+    }
+
+    #[test]
+    fn reset_average_makes_average_uniform() {
+        let m = BatchedMatcher::<Dcfr, Local>::new(2, 3, DiscountParams::RECOMMENDED);
+        let mut ev = [0.0f32; 2];
+        // Run ~20 updates with asymmetric rewards to push the average away from uniform.
+        for _ in 0..20 {
+            m.update_batch(|a, _| [1.0, -0.5, 0.2][a], &mut ev);
+        }
+        // Snapshot current strategy and clock for row 1.
+        let mut current_before = [0.0f32; 3];
+        m.current_into(1, &mut current_before);
+        let updates_before = m.num_updates();
+
+        // Reset only the average lane.
+        m.reset_average();
+
+        // Average should now be uniform (zeroed sum → normalize → 1/3 each).
+        let mut avg = [0.0f32; 3];
+        for row in 0..2 {
+            m.average_into(row, &mut avg);
+            for &v in &avg {
+                assert!(
+                    (v - 1.0 / 3.0).abs() < 1e-6,
+                    "row {row}: expected uniform after reset, got {avg:?}"
+                );
+            }
+        }
+
+        // current_into and num_updates must be unchanged.
+        let mut current_after = [0.0f32; 3];
+        m.current_into(1, &mut current_after);
+        assert_eq!(m.num_updates(), updates_before, "clock must not change");
+        for (b, a) in current_before.iter().zip(&current_after) {
+            assert_eq!(
+                b.to_bits(),
+                a.to_bits(),
+                "current strategy must be unchanged after reset_average"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_under_i16_reproduces_target_within_tolerance() {
+        use crate::lane::HalfBoth;
+        use crate::storage::Local;
+        let m = BatchedMatcher::<Dcfr, Local, HalfBoth>::new(1, 3, DiscountParams::RECOMMENDED);
+        let target = [0.2f32, 0.3, 0.5];
+        m.seed(|a, _| 100.0 * target[a], 50);
+        let mut out = [0.0f32; 3];
+        m.current_into(0, &mut out);
+        for (a, b) in target.iter().zip(&out) {
+            assert!(
+                (a - b).abs() < 2e-3,
+                "i16 seed within tolerance: {a} vs {b}"
+            );
+        }
+        assert_eq!(m.num_updates(), 50);
+    }
 }

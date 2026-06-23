@@ -75,15 +75,9 @@ impl FixedWidth for u32 {
 /// negative from float error) can never wrap the integer cast.
 #[must_use]
 pub fn quantize_dist<Q: FixedWidth>(probs: &[f32]) -> Vec<Q> {
-    let scale = Q::MAX_CODE as f32;
     probs
         .iter()
-        .map(|&x| {
-            let clamped = x.clamp(0.0, 1.0);
-            // `round` gives nearest-integer (ties away from zero), the choice
-            // that halves the worst-case error versus truncation.
-            Q::from_code((clamped * scale).round() as u32)
-        })
+        .map(|&x| Q::from_code(crate::unit_fixed::encode(x, Q::MAX_CODE)))
         .collect()
 }
 
@@ -92,8 +86,10 @@ pub fn quantize_dist<Q: FixedWidth>(probs: &[f32]) -> Vec<Q> {
 /// distribution, the only sensible distribution with no information.
 #[must_use]
 pub fn dequantize_dist<Q: FixedWidth>(codes: &[Q]) -> Vec<f32> {
-    let scale = Q::MAX_CODE as f32;
-    let mut out: Vec<f32> = codes.iter().map(|&c| c.code() as f32 / scale).collect();
+    let mut out: Vec<f32> = codes
+        .iter()
+        .map(|&c| crate::unit_fixed::decode(c.code(), Q::MAX_CODE))
+        .collect();
     crate::probability::normalize_inplace(&mut out);
     out
 }

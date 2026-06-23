@@ -39,7 +39,14 @@ pub trait RegretLane<B: StorageBackend>: Sized {
 /// `R::strategy_accumulation`.
 pub trait StrategyLane<R: UpdateRule, B: StorageBackend>: Sized {
     fn new(num_rows: usize, num_actions: usize) -> Self;
-    fn accumulate(&self, row: usize, num_actions: usize, step: &R::Step, strategy: &[f32]);
+    fn accumulate(
+        &self,
+        row: usize,
+        num_actions: usize,
+        step: &R::Step,
+        strategy: &[f32],
+        update_count: usize,
+    );
     fn average_into(&self, row: usize, num_actions: usize, out: &mut [f32]);
     /// Zero every cell that stores the accumulated average/strategy — every σ̄
     /// cell and, for `U16AvgStrategy`, every per-row weight `W`. Leaves
@@ -102,7 +109,14 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for F32SumStrategy<B> 
     fn new(num_rows: usize, num_actions: usize) -> Self {
         F32SumStrategy::new(num_rows, num_actions)
     }
-    fn accumulate(&self, row: usize, n: usize, step: &R::Step, strategy: &[f32]) {
+    fn accumulate(
+        &self,
+        row: usize,
+        n: usize,
+        step: &R::Step,
+        strategy: &[f32],
+        _update_count: usize,
+    ) {
         let (discount, weight) = R::strategy_accumulation(step);
         for (i, &s) in strategy[..n].iter().enumerate() {
             let idx = row * n + i;
@@ -138,8 +152,9 @@ impl<B: StorageBackend> F32SumStrategy<B> {
         n: usize,
         step: &R::Step,
         s: &[f32],
+        update_count: usize,
     ) {
-        <Self as StrategyLane<R, B>>::accumulate(self, row, n, step, s);
+        <Self as StrategyLane<R, B>>::accumulate(self, row, n, step, s, update_count);
     }
     pub(crate) fn average_into<R: UpdateRule>(&self, row: usize, n: usize, out: &mut [f32]) {
         <Self as StrategyLane<R, B>>::average_into(self, row, n, out);
@@ -162,6 +177,9 @@ impl<B: StorageBackend> F32SumStrategy<B> {
 /// `sum_p/Σsum_p` recurrence: `W ← discount·W + weight`,
 /// `σ̄ += (weight/W)·(σ − σ̄)`. Always in [0,1] (convex), so u16 fixed-point is
 /// safe. `average_into` returns σ̄ directly (one normalize repairs rounding drift).
+/// Encoding uses **stochastic rounding** keyed by `(row, action, update_count)`,
+/// so sub-quantum increments survive in expectation and the average does not
+/// freeze under high-γ long-horizon DCFR (see `unit_fixed::encode_stochastic`).
 pub struct U16AvgStrategy<B: StorageBackend> {
     cells: Vec<B::Cell<u16>>,
     weight: Vec<B::Cell<u32>>, // per-row W, f32 bits
@@ -186,11 +204,11 @@ impl<B: StorageBackend> U16AvgStrategy<B> {
     }
 
     #[inline]
-    fn set_sigma(&self, idx: usize, v: f32) {
-        // Safety: encode clamps v to [0,1] then multiplies by u16::MAX (65535),
-        // so the result is always in 0..=65535 — no truncation can occur.
+    fn set_sigma_stochastic(&self, idx: usize, v: f32, u01: f32) {
+        // Safety: encode_stochastic clamps v to [0,1] and clamps the code to
+        // 0..=MAX, so the result always fits a u16.
         #[allow(clippy::cast_possible_truncation)]
-        self.cells[idx].store(crate::unit_fixed::encode(v, Self::MAX) as u16);
+        self.cells[idx].store(crate::unit_fixed::encode_stochastic(v, Self::MAX, u01) as u16);
     }
 
     #[inline]
@@ -209,7 +227,14 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for U16AvgStrategy<B> 
         U16AvgStrategy::new(num_rows, num_actions)
     }
 
-    fn accumulate(&self, row: usize, n: usize, step: &R::Step, strategy: &[f32]) {
+    fn accumulate(
+        &self,
+        row: usize,
+        n: usize,
+        step: &R::Step,
+        strategy: &[f32],
+        update_count: usize,
+    ) {
         let (discount, weight) = R::strategy_accumulation(step);
         let w_new = discount * self.w_load(row) + weight;
         self.w_store(row, w_new);
@@ -217,7 +242,9 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for U16AvgStrategy<B> 
         for (i, &s) in strategy[..n].iter().enumerate() {
             let idx = row * n + i;
             let cur = self.sigma(idx);
-            self.set_sigma(idx, cur + frac * (s - cur));
+            let v = cur + frac * (s - cur);
+            let u = crate::unit_fixed::u01(row, i, update_count);
+            self.set_sigma_stochastic(idx, v, u);
         }
     }
 
@@ -257,8 +284,9 @@ impl<B: StorageBackend> U16AvgStrategy<B> {
         n: usize,
         step: &R::Step,
         s: &[f32],
+        update_count: usize,
     ) {
-        <Self as StrategyLane<R, B>>::accumulate(self, row, n, step, s);
+        <Self as StrategyLane<R, B>>::accumulate(self, row, n, step, s, update_count);
     }
 
     pub(crate) fn average_into<R: UpdateRule>(&self, row: usize, n: usize, out: &mut [f32]) {
@@ -309,11 +337,11 @@ impl<B: StorageBackend> U16AvgStrategyShared<B> {
     }
 
     #[inline]
-    fn set_sigma(&self, idx: usize, v: f32) {
-        // Safety: encode clamps v to [0,1] then multiplies by u16::MAX (65535),
-        // so the result is always in 0..=65535 — no truncation can occur.
+    fn set_sigma_stochastic(&self, idx: usize, v: f32, u01: f32) {
+        // Safety: encode_stochastic clamps v to [0,1] and clamps the code to
+        // 0..=MAX, so the result always fits a u16.
         #[allow(clippy::cast_possible_truncation)]
-        self.cells[idx].store(crate::unit_fixed::encode(v, Self::MAX) as u16);
+        self.cells[idx].store(crate::unit_fixed::encode_stochastic(v, Self::MAX, u01) as u16);
     }
 
     #[inline]
@@ -332,7 +360,14 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for U16AvgStrategyShar
         U16AvgStrategyShared::new(num_rows, num_actions)
     }
 
-    fn accumulate(&self, row: usize, n: usize, step: &R::Step, strategy: &[f32]) {
+    fn accumulate(
+        &self,
+        row: usize,
+        n: usize,
+        step: &R::Step,
+        strategy: &[f32],
+        update_count: usize,
+    ) {
         let (discount, weight) = R::strategy_accumulation(step);
         // Row 0 advances the shared W once per tick; rows ≠ 0 reuse it.
         if row == 0 {
@@ -344,7 +379,9 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for U16AvgStrategyShar
         for (i, &s) in strategy[..n].iter().enumerate() {
             let idx = row * n + i;
             let cur = self.sigma(idx);
-            self.set_sigma(idx, cur + frac * (s - cur));
+            let v = cur + frac * (s - cur);
+            let u = crate::unit_fixed::u01(row, i, update_count);
+            self.set_sigma_stochastic(idx, v, u);
         }
     }
 
@@ -382,8 +419,9 @@ impl<B: StorageBackend> U16AvgStrategyShared<B> {
         n: usize,
         step: &R::Step,
         s: &[f32],
+        update_count: usize,
     ) {
-        <Self as StrategyLane<R, B>>::accumulate(self, row, n, step, s);
+        <Self as StrategyLane<R, B>>::accumulate(self, row, n, step, s, update_count);
     }
 
     pub(crate) fn average_into<R: UpdateRule>(&self, row: usize, n: usize, out: &mut [f32]) {
@@ -544,6 +582,7 @@ mod tests {
     use crate::discount::DiscountParams;
     use crate::rules::Dcfr;
     use crate::storage::Local;
+    use crate::update_rule::UpdateRule;
 
     #[test]
     fn f32_regret_lane_round_trips_exactly() {
@@ -568,7 +607,7 @@ mod tests {
         let params = DiscountParams::RECOMMENDED;
         let step = Dcfr::step(&params, 1);
         let strat = [0.2f32, 0.3, 0.5];
-        lane.accumulate::<Dcfr>(0, 3, &step, &strat);
+        lane.accumulate::<Dcfr>(0, 3, &step, &strat, 1);
         let mut out = [0.0f32; 3];
         lane.average_into::<Dcfr>(0, 3, &mut out);
         // first accumulation: cell = weight*strat, normalize == strat
@@ -591,7 +630,7 @@ mod tests {
             } else {
                 [0.3f32, 0.7]
             };
-            lane.accumulate::<LinearCfr>(0, 2, &step, &strat);
+            lane.accumulate::<LinearCfr>(0, 2, &step, &strat, t);
             if t > 15_000 {
                 let mut cur = [0.0f32; 2];
                 lane.average_into::<LinearCfr>(0, 2, &mut cur);
@@ -620,8 +659,8 @@ mod tests {
         ];
         for (t, strat) in seq.iter().enumerate() {
             let step = Dcfr::step(&params, t + 1);
-            f32_lane.accumulate::<Dcfr>(0, 3, &step, strat);
-            u16_lane.accumulate::<Dcfr>(0, 3, &step, strat);
+            f32_lane.accumulate::<Dcfr>(0, 3, &step, strat, t + 1);
+            u16_lane.accumulate::<Dcfr>(0, 3, &step, strat, t + 1);
         }
         let mut a = [0.0f32; 3];
         let mut b = [0.0f32; 3];
@@ -670,14 +709,14 @@ mod tests {
         // Run a few accumulate steps to build up state.
         for t in 1..=5usize {
             let step = Dcfr::step(&params, t);
-            lane.accumulate::<Dcfr>(0, 3, &step, &[0.5, 0.3, 0.2]);
+            lane.accumulate::<Dcfr>(0, 3, &step, &[0.5, 0.3, 0.2], t);
         }
         // Reset zeros all σ̄ cells and W (call inherent to avoid rule type ambiguity).
         lane.reset_cells();
         // One accumulate with a known σ1.
         let sigma1 = [0.6f32, 0.25, 0.15];
         let step = Dcfr::step(&params, 6);
-        lane.accumulate::<Dcfr>(0, 3, &step, &sigma1);
+        lane.accumulate::<Dcfr>(0, 3, &step, &sigma1, 6);
         // With W zeroed before reset, frac = weight/(0+weight) = 1 → σ̄ = σ1.
         let mut out = [0.0f32; 3];
         lane.average_into::<Dcfr>(0, 3, &mut out);
@@ -714,10 +753,10 @@ mod tests {
         for (t, sigma) in strategies.iter().enumerate() {
             let step = Dcfr::step(&params, t + 1);
             // simulate update_batch: row 0 first, then row 1
-            per_row.accumulate::<Dcfr>(0, 3, &step, sigma);
-            per_row.accumulate::<Dcfr>(1, 3, &step, sigma);
-            shared.accumulate::<Dcfr>(0, 3, &step, sigma);
-            shared.accumulate::<Dcfr>(1, 3, &step, sigma);
+            per_row.accumulate::<Dcfr>(0, 3, &step, sigma, t + 1);
+            per_row.accumulate::<Dcfr>(1, 3, &step, sigma, t + 1);
+            shared.accumulate::<Dcfr>(0, 3, &step, sigma, t + 1);
+            shared.accumulate::<Dcfr>(1, 3, &step, sigma, t + 1);
         }
 
         let quantum = 2.0 / u16::MAX as f32;
@@ -733,5 +772,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The load-bearing regression: under DCFR γ=10 over >1M updates, the
+    /// stochastic-rounded u16 average must keep tracking the f32 average, where a
+    /// round-to-nearest u16 recurrence (computed inline) freezes. This is the
+    /// regime rs-poker's exploitability A/B exposed; PR #16 never exercised it.
+    #[test]
+    fn u16_stochastic_tracks_f32_where_round_to_nearest_freezes() {
+        let params = DiscountParams::new(2.3, 0.0, 10.0); // rs-poker's (α, β, γ)
+        let max = u16::MAX as u32;
+        let quantum = 1.0 / max as f32;
+
+        let f32_lane = F32SumStrategy::<Local>::new(1, 2);
+        let u16_lane = U16AvgStrategy::<Local>::new(1, 2);
+
+        // Inline round-to-nearest bounded average for component 0 (pre-fix behavior).
+        let mut rn_code: u32 = 0;
+        let mut rn_w: f32 = 0.0;
+
+        let n = 1_200_000usize;
+        let probe = 700_000usize; // far past the ~67k freeze crossover for γ=10
+        let (mut f32_at_probe, mut u16_at_probe, mut rn_at_probe) = (0.0f32, 0.0f32, 0u32);
+
+        for t in 1..=n {
+            let step = Dcfr::step(&params, t);
+            // Target drifts the whole way, so a correctly-tracking average must keep
+            // moving even once per-step corrections fall below the u16 quantum.
+            let g = t as f32 / n as f32;
+            let sigma = [0.3 + 0.4 * g, 0.7 - 0.4 * g];
+            f32_lane.accumulate::<Dcfr>(0, 2, &step, &sigma, t);
+            u16_lane.accumulate::<Dcfr>(0, 2, &step, &sigma, t);
+
+            let (discount, weight) = Dcfr::strategy_accumulation(&step);
+            rn_w = discount * rn_w + weight;
+            let frac = if rn_w > 0.0 { weight / rn_w } else { 0.0 };
+            let cur = rn_code as f32 / max as f32;
+            rn_code = crate::unit_fixed::encode(cur + frac * (sigma[0] - cur), max);
+
+            if t == probe {
+                let mut tmp = [0.0f32; 2];
+                f32_lane.average_into::<Dcfr>(0, 2, &mut tmp);
+                f32_at_probe = tmp[0];
+                u16_lane.average_into::<Dcfr>(0, 2, &mut tmp);
+                u16_at_probe = tmp[0];
+                rn_at_probe = rn_code;
+            }
+        }
+
+        let mut f = [0.0f32; 2];
+        let mut u = [0.0f32; 2];
+        f32_lane.average_into::<Dcfr>(0, 2, &mut f);
+        u16_lane.average_into::<Dcfr>(0, 2, &mut u);
+        let rn_end = rn_code as f32 / max as f32;
+
+        // f32 ground truth genuinely kept moving past the probe (test is in-regime).
+        let f32_late_move = (f[0] - f32_at_probe).abs();
+        assert!(
+            f32_late_move > 10.0 * quantum,
+            "not exercising late movement: {f32_late_move}"
+        );
+
+        // Round-to-nearest froze: essentially no movement after the probe.
+        let rn_late_move = (rn_end - rn_at_probe as f32 / max as f32).abs();
+        assert!(
+            rn_late_move < 2.0 * quantum,
+            "round-to-nearest unexpectedly moved: {rn_late_move}"
+        );
+
+        // Stochastic u16 kept moving and ends closer to f32 than the frozen lane.
+        let u16_late_move = (u[0] - u16_at_probe).abs();
+        assert!(
+            u16_late_move > 5.0 * quantum,
+            "stochastic u16 froze: {u16_late_move}"
+        );
+        assert!(
+            (u[0] - f[0]).abs() < (rn_end - f[0]).abs(),
+            "stochastic should track f32 better than frozen RN: u16={u:?} f32={f:?} rn={rn_end}"
+        );
     }
 }

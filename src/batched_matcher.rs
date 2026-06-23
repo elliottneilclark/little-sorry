@@ -204,7 +204,8 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
             R::post_discount(step),
             &mut s.strategy,
         );
-        self.strategy.accumulate(row, a, step, &s.strategy);
+        self.strategy
+            .accumulate(row, a, step, &s.strategy, self.num_updates());
 
         expected
     }

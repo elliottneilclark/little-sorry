@@ -320,6 +320,32 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
         self.strategy.average_into(row, self.num_actions, out);
     }
 
+    /// Write row `r`'s cumulative regret — the **signed accumulator** that drives
+    /// regret matching — into `out`. This is the primitive CFR state, *not* the
+    /// positive-part-normalized strategy `current_into` returns: the strategy is a
+    /// read-only projection (take each action's positive regret, normalize), so
+    /// the accumulator carries information (including negative regret) the strategy
+    /// discards.
+    ///
+    /// It is exactly the quantity [`seed`](Self::seed) writes, read through the
+    /// same [`RegretLane`](crate::lane::RegretLane), so `read → modify → seed`
+    /// round-trips: bit-exact for the `F32Regret` store, and within one row-scaled
+    /// quantum for the `Int16Regret` store (which decodes per-row-scaled i16).
+    ///
+    /// This is what makes an annealed warm-restart perturbation expressible:
+    /// `regret_into(row)` → add decaying noise → `seed(.., num_updates())` re-aims
+    /// the current strategy while keeping the iteration clock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= num_rows` or `out.len() < num_actions`.
+    pub fn regret_into(&self, row: usize, out: &mut [f32]) {
+        assert!(row < self.num_rows, "row out of range");
+        assert!(out.len() >= self.num_actions, "out too short");
+        self.regret
+            .read_row(row, self.num_actions, &mut out[..self.num_actions]);
+    }
+
     /// The average-regret convergence diagnostic for a row: the maximum positive
     /// cumulative regret over the shared regret-weight total. Tends to zero as
     /// the row approaches equilibrium; `0.0` before any update.
@@ -365,6 +391,7 @@ impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
 mod tests {
     use super::*;
     use crate::discount::DiscountParams;
+    use crate::lane::HalfRegret;
     use crate::rules::{Dcfr, PdcfrPlus};
     use crate::storage::Local;
 
@@ -626,5 +653,78 @@ mod tests {
             );
         }
         assert_eq!(m.num_updates(), 50);
+    }
+
+    #[test]
+    fn regret_into_matches_raw_regret_helper() {
+        // Build regret via a deterministic update sequence, then the public
+        // reader must equal the test-only raw_regret helper element-for-element.
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
+        for _ in 0..7 {
+            m.update_row(0, |a| [1.0, -0.5, 0.2][a]);
+        }
+        let mut out = [0.0f32; 3];
+        m.regret_into(0, &mut out);
+        let raw = m.raw_regret(0);
+        for (i, (&g, &w)) in out.iter().zip(&raw).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "regret_into[{i}] {g} != raw {w}");
+        }
+    }
+
+    #[test]
+    fn regret_into_then_seed_is_noop_on_current() {
+        // read → seed(read values, t0 = num_updates()) leaves next current strategy
+        // bit-identical for the exact F32 regret store.
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
+        for _ in 0..10 {
+            m.update_row(0, |a| [0.8, -0.3, 0.1][a]);
+        }
+        let mut before = [0.0f32; 3];
+        m.current_into(0, &mut before);
+
+        let mut r = [0.0f32; 3];
+        m.regret_into(0, &mut r);
+        m.seed(|a, _row| r[a], m.num_updates());
+
+        let mut after = [0.0f32; 3];
+        m.current_into(0, &mut after);
+        for (i, (&b, &a)) in before.iter().zip(&after).enumerate() {
+            assert_eq!(b.to_bits(), a.to_bits(), "current[{i}] changed: {b} != {a}");
+        }
+    }
+
+    #[test]
+    fn regret_into_decodes_int16_layout_within_quantum() {
+        // On the i16 regret layout, seed a known vector and read it back: decode
+        // must land within one row-scaled quantum of the seeded values.
+        let m = BatchedMatcher::<Dcfr, Local, HalfRegret>::new(1, 3, DiscountParams::RECOMMENDED);
+        let seeded = [1000.0f32, -250.0, 30.0];
+        m.seed(|a, _row| seeded[a], 5);
+        let mut out = [0.0f32; 3];
+        m.regret_into(0, &mut out);
+        // Int16Regret scale ≈ peak/i16::MAX = 1000/32767.
+        let quantum = 1000.0 / i16::MAX as f32;
+        for (i, (&g, &w)) in out.iter().zip(&seeded).enumerate() {
+            assert!(
+                (g - w).abs() <= quantum + 1e-2,
+                "regret_into[{i}] {g} vs seeded {w}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "row out of range")]
+    fn regret_into_panics_on_bad_row() {
+        let m = BatchedMatcher::<Dcfr, Local>::new(2, 3, DiscountParams::RECOMMENDED);
+        let mut out = [0.0f32; 3];
+        m.regret_into(2, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "out too short")]
+    fn regret_into_panics_on_short_out() {
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
+        let mut out = [0.0f32; 2];
+        m.regret_into(0, &mut out);
     }
 }

@@ -108,7 +108,7 @@ pub use pdcfr_plus::PdcfrPlusRegretMatcher;
 pub use regret_minimizer::RegretMinimizer;
 
 // Batched, storage-generic machinery.
-pub use batched_matcher::BatchedMatcher;
+pub use batched_matcher::{BatchedMatcher, Scratch};
 // Memory layout types.
 pub use lane::{
     F32Full, F32Regret, F32SumStrategy, HalfBoth, HalfBothShared, HalfRegret, HalfStrategy,

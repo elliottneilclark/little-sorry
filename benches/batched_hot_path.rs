@@ -5,7 +5,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use little_sorry::{Atomic, BatchedMatcher, Dcfr, DiscountParams, HalfStrategyShared};
+use little_sorry::{Atomic, BatchedMatcher, Dcfr, DiscountParams, HalfStrategyShared, Scratch};
 
 const NUM_ROWS: usize = 169;
 const NUM_ACTIONS: usize = 3;
@@ -32,6 +32,18 @@ fn bench_update_batch(c: &mut Criterion) {
     });
 }
 
+fn bench_update_batch_with(c: &mut Criterion) {
+    let m = new_matcher();
+    let mut scratch = Scratch::new(NUM_ACTIONS);
+    let mut expected = vec![0.0f32; NUM_ROWS];
+    c.bench_function("batched_update_batch_with_169x3", |b| {
+        b.iter(|| {
+            m.update_batch_with(&mut scratch, reward, &mut expected);
+            black_box(expected[0])
+        });
+    });
+}
+
 fn bench_current_into(c: &mut Criterion) {
     let m = new_matcher();
     let mut expected = vec![0.0f32; NUM_ROWS];
@@ -49,5 +61,10 @@ fn bench_current_into(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_update_batch, bench_current_into);
+criterion_group!(
+    benches,
+    bench_update_batch,
+    bench_update_batch_with,
+    bench_current_into
+);
 criterion_main!(benches);

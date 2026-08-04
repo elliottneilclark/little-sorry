@@ -20,6 +20,10 @@ run = 'cargo nextest run --all-features --workspace --examples --bins --lib'
 description = "Test code examples in documentation"
 run = 'cargo test --doc --all-features --workspace'
 
+[tasks.'check:bench']
+description = "Build benches and smoke-run them once (criterion --test mode)"
+run = 'cargo bench --all-features -- --test'
+
 [tasks.'check:taplo:lint']
 description = "Check TOML files formatting"
 run = 'taplo lint $(git ls-files "*.toml")'

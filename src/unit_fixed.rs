@@ -15,25 +15,58 @@ pub(crate) fn decode(code: u32, max_code: u32) -> f32 {
     code as f32 / max_code as f32
 }
 
-/// Deterministic, stateless draw in `[0, 1)` from a cell+tick key. Same key ⇒
-/// same value; no shared mutable state, so it is reproducible and race-free
-/// under the `Atomic` backend. The three key components are mixed into one word
-/// and run through the splitmix64 finalizer; the top 24 bits become the fraction
-/// (24 bits is exactly representable in an `f32` mantissa, so the division is
-/// exact and unbiased).
+/// Splitmix64-finalized hash of a `(row, update_count, chunk)` key — the same
+/// key-mix the old per-cell hash used, with the 4-action chunk index in the
+/// per-action slot. One output word carries four independent 16-bit draws.
 #[inline]
-pub(crate) fn u01(row: usize, action: usize, update_count: usize) -> f32 {
+fn row_bits(row: usize, update_count: usize, chunk: usize) -> u64 {
     let mut z = (row as u64)
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add((action as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
+        .wrapping_add((chunk as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F))
         .wrapping_add((update_count as u64).wrapping_mul(0x1656_67B1_9E37_79F9));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    // Top 24 bits → [0, 1).
-    #[allow(clippy::cast_precision_loss)]
-    let num = (z >> 40) as f32;
-    num / ((1u32 << 24) as f32)
+    z ^ (z >> 31)
+}
+
+/// Deterministic, stateless per-row draw stream for stochastic rounding: one
+/// [`row_bits`] hash yields draws for four actions (16 bits each — exactly
+/// the u16 lane quantum), so a row of ≤ 4 actions costs one hash per tick
+/// where a per-cell hash would cost one per action. Same key ⇒ same stream;
+/// no shared mutable state, so it is reproducible and race-free under the
+/// `Atomic` backend. `bits / 2^16` is exact in f32, so draws are unbiased on
+/// the 2⁻¹⁶ grid.
+pub(crate) struct RowDraws {
+    row: usize,
+    update_count: usize,
+    bits: u64,
+    action: usize,
+}
+
+impl RowDraws {
+    #[inline]
+    pub(crate) fn new(row: usize, update_count: usize) -> Self {
+        Self {
+            row,
+            update_count,
+            bits: row_bits(row, update_count, 0),
+            action: 0,
+        }
+    }
+
+    /// The draw for the next action of this row/tick, in `[0, 1)`.
+    #[inline]
+    pub(crate) fn next_u01(&mut self) -> f32 {
+        let (chunk, slot) = (self.action / 4, self.action % 4);
+        if self.action > 0 && slot == 0 {
+            self.bits = row_bits(self.row, self.update_count, chunk);
+        }
+        self.action += 1;
+        // Truncating to the slot's low 16 bits is the point of the shift.
+        #[allow(clippy::cast_possible_truncation)]
+        let bits16 = (self.bits >> (16 * slot)) as u16;
+        f32::from(bits16) / 65_536.0
+    }
 }
 
 /// Stochastic-rounding encode of `x ∈ [0,1]` to a code in `0..=max_code`, using a
@@ -78,19 +111,83 @@ mod tests {
     }
 
     #[test]
-    fn u01_is_deterministic_and_in_range() {
-        // Same key ⇒ identical bits; draws stay in [0, 1).
-        for &(r, a, t) in &[(0usize, 0usize, 1usize), (3, 1, 999), (7, 2, 67_000)] {
-            assert_eq!(u01(r, a, t).to_bits(), u01(r, a, t).to_bits());
-        }
-        for t in 0..10_000usize {
-            let u = u01(t % 5, t % 3, t);
-            assert!((0.0..1.0).contains(&u), "u01 out of range: {u}");
+    fn row_draws_deterministic_and_in_range() {
+        for &(r, t) in &[(0usize, 1usize), (3, 999), (168, 67_000)] {
+            let mut a = RowDraws::new(r, t);
+            let mut b = RowDraws::new(r, t);
+            for _ in 0..8 {
+                // 8 draws crosses a chunk boundary (two hashes).
+                let (x, y) = (a.next_u01(), b.next_u01());
+                assert_eq!(x.to_bits(), y.to_bits(), "same key ⇒ same stream");
+                assert!((0.0..1.0).contains(&x), "draw out of range: {x}");
+            }
         }
         // Distinct keys generally differ (guards against a constant generator).
-        assert_ne!(u01(0, 0, 1), u01(0, 0, 2));
-        assert_ne!(u01(0, 0, 1), u01(1, 0, 1));
-        assert_ne!(u01(0, 0, 1), u01(0, 1, 1));
+        assert_ne!(
+            RowDraws::new(0, 1).next_u01(),
+            RowDraws::new(0, 2).next_u01()
+        );
+        assert_ne!(
+            RowDraws::new(0, 1).next_u01(),
+            RowDraws::new(1, 1).next_u01()
+        );
+    }
+
+    #[test]
+    fn row_draws_are_unbiased_per_action() {
+        // E[encode_stochastic] must recover a sub-quantum value for EVERY
+        // action slot of the row hash, not just slot 0.
+        let max = u16::MAX as u32;
+        let x = 0.001_530_5_f32;
+        let scaled = f64::from(x.clamp(0.0, 1.0) * max as f32);
+        let n = 200_000u32;
+        for action in 0..4usize {
+            let mut sum = 0u64;
+            for t in 0..n {
+                let mut draws = RowDraws::new(7, t as usize);
+                let mut u = draws.next_u01();
+                for _ in 0..action {
+                    u = draws.next_u01();
+                }
+                sum += u64::from(encode_stochastic(x, max, u));
+            }
+            let mean = sum as f64 / f64::from(n);
+            assert!(
+                (mean - scaled).abs() < 0.05,
+                "action {action} biased: mean {mean} vs true {scaled}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_draws_are_independent_across_actions() {
+        // Draws for different actions of one row come from disjoint 16-bit
+        // slices; empirically the joint sub-median event must hit ~1/4.
+        let n = 100_000usize;
+        let mut below = [0u32; 4];
+        let mut joint = [[0u32; 4]; 4];
+        for t in 0..n {
+            let mut draws = RowDraws::new(3, t);
+            let u: Vec<f32> = (0..4).map(|_| draws.next_u01()).collect();
+            for a in 0..4 {
+                if u[a] < 0.5 {
+                    below[a] += 1;
+                }
+                for b in (a + 1)..4 {
+                    if u[a] < 0.5 && u[b] < 0.5 {
+                        joint[a][b] += 1;
+                    }
+                }
+            }
+        }
+        for a in 0..4 {
+            let p = f64::from(below[a]) / n as f64;
+            assert!((p - 0.5).abs() < 0.01, "action {a} marginal {p}");
+            for b in (a + 1)..4 {
+                let p = f64::from(joint[a][b]) / n as f64;
+                assert!((p - 0.25).abs() < 0.01, "pair ({a},{b}) joint {p}");
+            }
+        }
     }
 
     #[test]
@@ -131,7 +228,7 @@ mod tests {
         let n = 200_000u32;
         let mut sum = 0u64;
         for t in 0..n {
-            let u = u01(7, 2, t as usize);
+            let u = RowDraws::new(7, t as usize).next_u01();
             sum += u64::from(encode_stochastic(x, max, u));
         }
         let mean = sum as f64 / f64::from(n);

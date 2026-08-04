@@ -59,6 +59,33 @@ impl Scratch {
     }
 }
 
+/// Actions covered by the stack-allocated row buffer; larger rows fall back
+/// to the heap. Downstream consumers run ≤ 4 actions.
+const INLINE_ACTIONS: usize = 8;
+
+/// A row-sized f32 buffer: inline array up to [`INLINE_ACTIONS`], heap `Vec`
+/// beyond, so read paths stay allocation-free at practical action counts.
+enum RowBuf {
+    Inline([f32; INLINE_ACTIONS]),
+    Heap(Vec<f32>),
+}
+
+impl RowBuf {
+    fn new(len: usize) -> Self {
+        if len <= INLINE_ACTIONS {
+            RowBuf::Inline([0.0; INLINE_ACTIONS])
+        } else {
+            RowBuf::Heap(vec![0.0; len])
+        }
+    }
+    fn slice_mut(&mut self, len: usize) -> &mut [f32] {
+        match self {
+            RowBuf::Inline(a) => &mut a[..len],
+            RowBuf::Heap(v) => &mut v[..len],
+        }
+    }
+}
+
 /// A batched regret matcher generic over the update rule `R`, the storage
 /// backend `B`, and the memory layout `L` (which lane stores hold cumulative
 /// regret and cumulative strategy). `L` defaults to [`F32Full`], reproducing
@@ -337,22 +364,29 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     pub fn current_into(&self, row: usize, out: &mut [f32]) {
         assert!(row < self.num_rows, "row out of range");
         assert!(out.len() >= self.num_actions, "out too short");
-        let out = &mut out[..self.num_actions];
+        let n = self.num_actions;
+        let out = &mut out[..n];
         let t = self.num_updates();
         let step = R::step(&self.params, t);
         let predictive = R::LANES > 2;
-        let mut regret = vec![0.0; self.num_actions];
-        let mut last_inst = vec![0.0; self.num_actions];
-        self.regret.read_row(row, self.num_actions, &mut regret);
-        if predictive {
-            for (i, slot) in last_inst.iter_mut().enumerate() {
-                *slot = self.li_load(row * self.num_actions + i);
-            }
+
+        let mut regret_buf = RowBuf::new(n);
+        let regret = regret_buf.slice_mut(n);
+        self.regret.read_row(row, n, regret);
+
+        // 2-lane rules never read the last-instantaneous lane; hand them an
+        // empty slice instead of materializing a dead buffer.
+        let last_n = if predictive { n } else { 0 };
+        let mut last_buf = RowBuf::new(last_n);
+        let last_inst = last_buf.slice_mut(last_n);
+        for (i, slot) in last_inst.iter_mut().enumerate() {
+            *slot = self.li_load(row * n + i);
         }
+
         R::strategy_from_lanes(
             &self.params,
-            &regret,
-            &last_inst,
+            regret,
+            last_inst,
             R::post_discount(&step),
             out,
         );
@@ -913,11 +947,16 @@ mod alloc_tests {
         );
         let mut scratch = Scratch::new(4);
         let mut expected = vec![0.0f32; 169];
+        let mut out = [0.0f32; 3];
         // Warm-up outside the counted section.
         m.update_batch_with(&mut scratch, |a, _| [1.0, -0.5, 0.25][a], &mut expected);
+        m.current_into(0, &mut out);
         let n = allocations_in(|| {
             for _ in 0..10 {
                 m.update_batch_with(&mut scratch, |a, _| [1.0, -0.5, 0.25][a], &mut expected);
+                for row in 0..169 {
+                    m.current_into(row, &mut out);
+                }
             }
         });
         assert_eq!(n, 0, "hot path performed {n} heap allocations");

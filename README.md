@@ -27,7 +27,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-little-sorry = "4.0.0"
+little-sorry = "4.1.0"
 ```
 
 ### Quick Example

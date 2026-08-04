@@ -40,6 +40,10 @@ required-features = ["rps"]
 name = "cfr_hot_path"
 harness = false
 
+[[bench]]
+name = "batched_hot_path"
+harness = false
+
 [[test]]
 name = "convergence"
 required-features = ["rps"]

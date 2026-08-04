@@ -177,9 +177,11 @@ impl<B: StorageBackend> F32SumStrategy<B> {
 /// `sum_p/Σsum_p` recurrence: `W ← discount·W + weight`,
 /// `σ̄ += (weight/W)·(σ − σ̄)`. Always in [0,1] (convex), so u16 fixed-point is
 /// safe. `average_into` returns σ̄ directly (one normalize repairs rounding drift).
-/// Encoding uses **stochastic rounding** keyed by `(row, action, update_count)`,
-/// so sub-quantum increments survive in expectation and the average does not
-/// freeze under high-γ long-horizon DCFR (see `unit_fixed::encode_stochastic`).
+/// Encoding uses **stochastic rounding** keyed by `(row, update_count)` — one
+/// hash per row per tick yields an independent 16-bit draw per action (see
+/// `unit_fixed::RowDraws`) — so sub-quantum increments survive in expectation
+/// and the average does not freeze under high-γ long-horizon DCFR (see
+/// `unit_fixed::encode_stochastic`).
 pub struct U16AvgStrategy<B: StorageBackend> {
     cells: Vec<B::Cell<u16>>,
     weight: Vec<B::Cell<u32>>, // per-row W, f32 bits
@@ -239,12 +241,12 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for U16AvgStrategy<B> 
         let w_new = discount * self.w_load(row) + weight;
         self.w_store(row, w_new);
         let frac = if w_new > 0.0 { weight / w_new } else { 0.0 };
+        let mut draws = crate::unit_fixed::RowDraws::new(row, update_count);
         for (i, &s) in strategy[..n].iter().enumerate() {
             let idx = row * n + i;
             let cur = self.sigma(idx);
             let v = cur + frac * (s - cur);
-            let u = crate::unit_fixed::u01(row, i, update_count);
-            self.set_sigma_stochastic(idx, v, u);
+            self.set_sigma_stochastic(idx, v, draws.next_u01());
         }
     }
 
@@ -376,12 +378,12 @@ impl<R: UpdateRule, B: StorageBackend> StrategyLane<R, B> for U16AvgStrategyShar
         }
         let w = self.w_load();
         let frac = if w > 0.0 { weight / w } else { 0.0 };
+        let mut draws = crate::unit_fixed::RowDraws::new(row, update_count);
         for (i, &s) in strategy[..n].iter().enumerate() {
             let idx = row * n + i;
             let cur = self.sigma(idx);
             let v = cur + frac * (s - cur);
-            let u = crate::unit_fixed::u01(row, i, update_count);
-            self.set_sigma_stochastic(idx, v, u);
+            self.set_sigma_stochastic(idx, v, draws.next_u01());
         }
     }
 

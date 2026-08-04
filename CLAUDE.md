@@ -12,6 +12,7 @@ mise run check:clippy       # Check for lints (all features enabled)
 mise run check:test:nextest # Run tests with nextest
 mise run check:test:docs    # Test documentation examples
 mise run check:taplo:lint   # Lint TOML files
+mise run check:bench        # Build + smoke-run benches (criterion --test mode)
 
 # Fix issues
 mise fix                    # Run all fixers

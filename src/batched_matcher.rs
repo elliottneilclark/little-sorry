@@ -28,10 +28,12 @@ use crate::storage::{AccumCell, CounterCell, StorageBackend};
 use crate::update_rule::UpdateRule;
 use std::marker::PhantomData;
 
-/// Per-call working buffers, sized to one row. Allocated once per update call
-/// and reused across every row in a batch, so the per-row hot path allocates
-/// nothing.
-struct Scratch {
+/// Reusable working buffers for one row's update. Constructed once (e.g. one
+/// per worker thread) and reused across calls via
+/// [`BatchedMatcher::update_batch_with`], so the per-visit hot path performs
+/// no heap allocation. A scratch built for `num_actions` serves any matcher
+/// with that many actions or fewer.
+pub struct Scratch {
     regret: Vec<f32>,
     last_inst: Vec<f32>,
     strategy: Vec<f32>,
@@ -39,12 +41,47 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(num_actions: usize) -> Self {
+    /// Buffers sized for matchers with up to `num_actions` actions.
+    #[must_use]
+    pub fn new(num_actions: usize) -> Self {
         Self {
             regret: vec![0.0; num_actions],
             last_inst: vec![0.0; num_actions],
             strategy: vec![0.0; num_actions],
             reward: vec![0.0; num_actions],
+        }
+    }
+
+    /// The action capacity this scratch was built for.
+    #[must_use]
+    pub fn num_actions(&self) -> usize {
+        self.regret.len()
+    }
+}
+
+/// Actions covered by the stack-allocated row buffer; larger rows fall back
+/// to the heap. Downstream consumers run ≤ 4 actions.
+const INLINE_ACTIONS: usize = 8;
+
+/// A row-sized f32 buffer: inline array up to [`INLINE_ACTIONS`], heap `Vec`
+/// beyond, so read paths stay allocation-free at practical action counts.
+enum RowBuf {
+    Inline([f32; INLINE_ACTIONS]),
+    Heap(Vec<f32>),
+}
+
+impl RowBuf {
+    fn new(len: usize) -> Self {
+        if len <= INLINE_ACTIONS {
+            RowBuf::Inline([0.0; INLINE_ACTIONS])
+        } else {
+            RowBuf::Heap(vec![0.0; len])
+        }
+    }
+    fn slice_mut(&mut self, len: usize) -> &mut [f32] {
+        match self {
+            RowBuf::Inline(a) => &mut a[..len],
+            RowBuf::Heap(v) => &mut v[..len],
         }
     }
 }
@@ -162,8 +199,10 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
         let predictive = R::LANES > 2;
 
         // Snapshot the lanes we read, and cache the rewards so the value
-        // accessor is called exactly once per action.
-        self.regret.read_row(row, a, &mut s.regret);
+        // accessor is called exactly once per action. The scratch may be
+        // over-sized (built for a wider matcher), so every buffer is sliced
+        // to this matcher's action count.
+        self.regret.read_row(row, a, &mut s.regret[..a]);
         for i in 0..a {
             if predictive {
                 s.last_inst[i] = self.li_load(row * a + i);
@@ -176,12 +215,12 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
         // regret term by the previous iterate's factor).
         R::strategy_from_lanes(
             &self.params,
-            &s.regret,
-            &s.last_inst,
+            &s.regret[..a],
+            &s.last_inst[..a],
             R::pre_discount(step),
-            &mut s.strategy,
+            &mut s.strategy[..a],
         );
-        let expected = crate::vector_ops::dot(&s.strategy, &s.reward);
+        let expected = crate::vector_ops::dot(&s.strategy[..a], &s.reward[..a]);
 
         // Per-cell regret update; predictive rules also store the fresh
         // instantaneous regret for next tick's prediction.
@@ -193,19 +232,19 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
                 s.last_inst[i] = inst;
             }
         }
-        self.regret.write_row(row, a, &s.regret);
+        self.regret.write_row(row, a, &s.regret[..a]);
 
         // The strategy this tick plays (and accumulates) is derived from the
         // updated lanes, then folded into the cumulative-strategy lane.
         R::strategy_from_lanes(
             &self.params,
-            &s.regret,
-            &s.last_inst,
+            &s.regret[..a],
+            &s.last_inst[..a],
             R::post_discount(step),
-            &mut s.strategy,
+            &mut s.strategy[..a],
         );
         self.strategy
-            .accumulate(row, a, step, &s.strategy, self.num_updates());
+            .accumulate(row, a, step, &s.strategy[..a], self.num_updates());
 
         expected
     }
@@ -219,14 +258,34 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     ///
     /// Panics if `expected_out.len() < num_rows`.
     pub fn update_batch(&self, value: impl Fn(usize, usize) -> f32, expected_out: &mut [f32]) {
+        self.update_batch_with(&mut Scratch::new(self.num_actions), value, expected_out);
+    }
+
+    /// [`update_batch`](Self::update_batch) with caller-owned scratch buffers —
+    /// the allocation-free hot path. Keep one [`Scratch`] per worker thread and
+    /// reuse it across calls and matchers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expected_out.len() < num_rows` or
+    /// `scratch.num_actions() < num_actions`.
+    pub fn update_batch_with(
+        &self,
+        scratch: &mut Scratch,
+        value: impl Fn(usize, usize) -> f32,
+        expected_out: &mut [f32],
+    ) {
         assert!(
             expected_out.len() >= self.num_rows,
             "expected_out too short"
         );
+        assert!(
+            scratch.num_actions() >= self.num_actions,
+            "scratch too small"
+        );
         let step = self.tick();
-        let mut scratch = Scratch::new(self.num_actions);
         for (row, ev) in expected_out.iter_mut().enumerate().take(self.num_rows) {
-            *ev = self.update_one(row, &step, |a| value(a, row), &mut scratch);
+            *ev = self.update_one(row, &step, |a| value(a, row), scratch);
         }
         self.advance_weight(&step);
     }
@@ -239,10 +298,28 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     ///
     /// Panics if `row >= num_rows`.
     pub fn update_row(&self, row: usize, value: impl Fn(usize) -> f32) -> f32 {
+        self.update_row_with(&mut Scratch::new(self.num_actions), row, value)
+    }
+
+    /// [`update_row`](Self::update_row) with caller-owned scratch buffers — the
+    /// allocation-free single-row path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= num_rows` or `scratch.num_actions() < num_actions`.
+    pub fn update_row_with(
+        &self,
+        scratch: &mut Scratch,
+        row: usize,
+        value: impl Fn(usize) -> f32,
+    ) -> f32 {
         assert!(row < self.num_rows, "row out of range");
+        assert!(
+            scratch.num_actions() >= self.num_actions,
+            "scratch too small"
+        );
         let step = self.tick();
-        let mut scratch = Scratch::new(self.num_actions);
-        let ev = self.update_one(row, &step, value, &mut scratch);
+        let ev = self.update_one(row, &step, value, scratch);
         self.advance_weight(&step);
         ev
     }
@@ -287,22 +364,29 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     pub fn current_into(&self, row: usize, out: &mut [f32]) {
         assert!(row < self.num_rows, "row out of range");
         assert!(out.len() >= self.num_actions, "out too short");
-        let out = &mut out[..self.num_actions];
+        let n = self.num_actions;
+        let out = &mut out[..n];
         let t = self.num_updates();
         let step = R::step(&self.params, t);
         let predictive = R::LANES > 2;
-        let mut regret = vec![0.0; self.num_actions];
-        let mut last_inst = vec![0.0; self.num_actions];
-        self.regret.read_row(row, self.num_actions, &mut regret);
-        if predictive {
-            for (i, slot) in last_inst.iter_mut().enumerate() {
-                *slot = self.li_load(row * self.num_actions + i);
-            }
+
+        let mut regret_buf = RowBuf::new(n);
+        let regret = regret_buf.slice_mut(n);
+        self.regret.read_row(row, n, regret);
+
+        // 2-lane rules never read the last-instantaneous lane; hand them an
+        // empty slice instead of materializing a dead buffer.
+        let last_n = if predictive { n } else { 0 };
+        let mut last_buf = RowBuf::new(last_n);
+        let last_inst = last_buf.slice_mut(last_n);
+        for (i, slot) in last_inst.iter_mut().enumerate() {
+            *slot = self.li_load(row * n + i);
         }
+
         R::strategy_from_lanes(
             &self.params,
-            &regret,
-            &last_inst,
+            regret,
+            last_inst,
             R::post_discount(&step),
             out,
         );
@@ -727,5 +811,154 @@ mod tests {
         let m = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
         let mut out = [0.0f32; 2];
         m.regret_into(0, &mut out);
+    }
+
+    #[test]
+    fn update_batch_with_matches_update_batch_bit_for_bit() {
+        // Twin matchers over an identical deterministic reward stream; one uses
+        // the allocating entry point, the other a reused, over-sized scratch.
+        let params = DiscountParams::RECOMMENDED;
+        let a = BatchedMatcher::<Dcfr, Local>::new(3, 3, params);
+        let b = BatchedMatcher::<Dcfr, Local>::new(3, 3, params);
+        let mut scratch = Scratch::new(5); // over-sized on purpose
+        let mut ev_a = [0.0f32; 3];
+        let mut ev_b = [0.0f32; 3];
+        let mut state = 0x9876_5432_10ab_cdefu64;
+        for _ in 0..100 {
+            let rewards: Vec<f32> = (0..9).map(|_| next_reward(&mut state)).collect();
+            a.update_batch(|act, row| rewards[row * 3 + act], &mut ev_a);
+            b.update_batch_with(&mut scratch, |act, row| rewards[row * 3 + act], &mut ev_b);
+            for (x, y) in ev_a.iter().zip(&ev_b) {
+                assert_eq!(x.to_bits(), y.to_bits(), "expected values diverged");
+            }
+            for row in 0..3 {
+                assert_bits("regret", &b.raw_regret(row), &a.raw_regret(row));
+                assert_bits("strategy", &b.raw_strategy(row), &a.raw_strategy(row));
+            }
+        }
+    }
+
+    #[test]
+    fn update_row_with_matches_update_row_bit_for_bit() {
+        let params = DiscountParams::RECOMMENDED;
+        let a = BatchedMatcher::<Dcfr, Local>::new(1, 3, params);
+        let b = BatchedMatcher::<Dcfr, Local>::new(1, 3, params);
+        let mut scratch = Scratch::new(3);
+        let mut state = 0x0f0f_1234_dead_beefu64;
+        for _ in 0..100 {
+            let rewards: Vec<f32> = (0..3).map(|_| next_reward(&mut state)).collect();
+            let ev_a = a.update_row(0, |act| rewards[act]);
+            let ev_b = b.update_row_with(&mut scratch, 0, |act| rewards[act]);
+            assert_eq!(ev_a.to_bits(), ev_b.to_bits(), "expected values diverged");
+            assert_bits("regret", &b.raw_regret(0), &a.raw_regret(0));
+            assert_bits("strategy", &b.raw_strategy(0), &a.raw_strategy(0));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "scratch too small")]
+    fn update_batch_with_panics_on_small_scratch() {
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
+        let mut scratch = Scratch::new(2);
+        let mut ev = [0.0f32; 1];
+        m.update_batch_with(&mut scratch, |a, _| a as f32, &mut ev);
+    }
+}
+
+/// Thread-filtered allocation counting: the global allocator counts only
+/// while the current thread has opted in, so unrelated tests running in the
+/// same process (plain `cargo test`) cannot perturb the count.
+#[cfg(test)]
+mod alloc_tests {
+    use super::*;
+    use crate::discount::DiscountParams;
+    use crate::lane::HalfStrategyShared;
+    use crate::rules::Dcfr;
+    use crate::storage::Atomic;
+    use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        // const-initialized TLS: no lazy allocation inside the allocator.
+        static COUNTING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct CountingAlloc;
+
+    fn note_alloc() {
+        // try_with: TLS may be unavailable during thread teardown.
+        let _ = COUNTING.try_with(|c| {
+            if c.get() {
+                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, l: AllocLayout) -> *mut u8 {
+            note_alloc();
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn alloc_zeroed(&self, l: AllocLayout) -> *mut u8 {
+            note_alloc();
+            unsafe { System.alloc_zeroed(l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: AllocLayout, n: usize) -> *mut u8 {
+            note_alloc();
+            unsafe { System.realloc(p, l, n) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: AllocLayout) {
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
+
+    fn allocations_in(f: impl FnOnce()) -> usize {
+        COUNTING.with(|c| c.set(true));
+        let before = ALLOC_COUNT.load(Ordering::Relaxed);
+        f();
+        let after = ALLOC_COUNT.load(Ordering::Relaxed);
+        COUNTING.with(|c| c.set(false));
+        after - before
+    }
+
+    #[test]
+    fn counting_harness_detects_allocations() {
+        // Negative control: a plain Vec allocation must register, otherwise
+        // the zero-alloc assertion below would pass vacuously.
+        let n = allocations_in(|| {
+            let v = vec![0u8; 128];
+            std::hint::black_box(&v);
+        });
+        assert!(n > 0, "counting allocator failed to observe an allocation");
+    }
+
+    #[test]
+    fn hot_path_is_allocation_free() {
+        // The exact consumer profile: Dcfr, Atomic, HalfStrategyShared.
+        let m = BatchedMatcher::<Dcfr, Atomic, HalfStrategyShared>::new(
+            169,
+            3,
+            DiscountParams::new(3.0, 0.0, 20.0),
+        );
+        let mut scratch = Scratch::new(4);
+        let mut expected = vec![0.0f32; 169];
+        let mut out = [0.0f32; 3];
+        // Warm-up outside the counted section.
+        m.update_batch_with(&mut scratch, |a, _| [1.0, -0.5, 0.25][a], &mut expected);
+        m.current_into(0, &mut out);
+        let n = allocations_in(|| {
+            for _ in 0..10 {
+                m.update_batch_with(&mut scratch, |a, _| [1.0, -0.5, 0.25][a], &mut expected);
+                for row in 0..169 {
+                    m.current_into(row, &mut out);
+                }
+            }
+        });
+        assert_eq!(n, 0, "hot path performed {n} heap allocations");
     }
 }

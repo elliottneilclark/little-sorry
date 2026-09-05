@@ -104,6 +104,14 @@ impl UpdateRule for Dcfr {
         old * d + (reward - expected)
     }
 
+    const FLOORS_REGRET: bool = false;
+    fn regret_discount(s: &Self::Step, old: f32) -> f32 {
+        if old > 0.0 { s.positive } else { s.negative }
+    }
+    fn regret_increment(_: &Self::Step, reward: f32, expected: f32) -> f32 {
+        reward - expected
+    }
+
     fn strategy_accumulation(s: &Self::Step) -> (f32, f32) {
         (s.strategy, 1.0)
     }
@@ -172,6 +180,14 @@ impl UpdateRule for DcfrPlus {
         (old * s.regret + reward - expected).max(0.0)
     }
 
+    const FLOORS_REGRET: bool = true;
+    fn regret_discount(s: &Self::Step, _old: f32) -> f32 {
+        s.regret
+    }
+    fn regret_increment(_: &Self::Step, reward: f32, expected: f32) -> f32 {
+        reward - expected
+    }
+
     fn strategy_accumulation(s: &Self::Step) -> (f32, f32) {
         (s.strategy, 1.0)
     }
@@ -219,6 +235,14 @@ impl UpdateRule for LinearCfr {
 
     fn accumulate_regret(s: &Self::Step, old: f32, reward: f32, expected: f32) -> f32 {
         old + s.t * (reward - expected)
+    }
+
+    const FLOORS_REGRET: bool = false;
+    fn regret_discount(_: &Self::Step, _old: f32) -> f32 {
+        1.0
+    }
+    fn regret_increment(s: &Self::Step, reward: f32, expected: f32) -> f32 {
+        s.t * (reward - expected)
     }
 
     fn strategy_accumulation(s: &Self::Step) -> (f32, f32) {
@@ -278,6 +302,14 @@ impl UpdateRule for PcfrPlus {
 
     fn accumulate_regret(_: &Self::Step, old: f32, reward: f32, expected: f32) -> f32 {
         (old + (reward - expected)).max(0.0)
+    }
+
+    const FLOORS_REGRET: bool = true;
+    fn regret_discount(_: &Self::Step, _old: f32) -> f32 {
+        1.0
+    }
+    fn regret_increment(_: &Self::Step, reward: f32, expected: f32) -> f32 {
+        reward - expected
     }
 
     fn strategy_accumulation(s: &Self::Step) -> (f32, f32) {
@@ -355,6 +387,14 @@ impl UpdateRule for PdcfrPlus {
     fn accumulate_regret(s: &Self::Step, old: f32, reward: f32, expected: f32) -> f32 {
         // Parenthesized inst, mirroring pdcfr_plus.rs.
         (old * s.previous + (reward - expected)).max(0.0)
+    }
+
+    const FLOORS_REGRET: bool = true;
+    fn regret_discount(s: &Self::Step, _old: f32) -> f32 {
+        s.previous
+    }
+    fn regret_increment(_: &Self::Step, reward: f32, expected: f32) -> f32 {
+        reward - expected
     }
 
     fn strategy_accumulation(s: &Self::Step) -> (f32, f32) {
@@ -500,5 +540,40 @@ mod tests {
         let mut out = [0.0f32; 2];
         PdcfrPlus::strategy_from_lanes(&p, &[1.0, 1.0], &[0.0, 0.0], curr, &mut out);
         assert!((out[0] - 0.5).abs() < 1e-6 && (out[1] - 0.5).abs() < 1e-6);
+    }
+    /// The split form every integer-accumulating lane relies on must agree
+    /// with the bit-exact f32 form for every rule, at both signs of old regret.
+    #[test]
+    fn regret_split_reconstructs_accumulate_regret() {
+        fn check<R: UpdateRule>(name: &str, params: &R::Params) {
+            for t in [1usize, 2, 7, 500] {
+                let s = R::step(params, t);
+                for &(old, reward, expected) in &[
+                    (2.0f32, 5.0f32, 1.0f32),
+                    (-2.0, 5.0, 1.0),
+                    (0.0, -3.0, 0.5),
+                    (1e6, 0.25, 0.75),
+                    (-1e6, 0.25, 0.75),
+                ] {
+                    let exact = R::accumulate_regret(&s, old, reward, expected);
+                    let split = old * R::regret_discount(&s, old)
+                        + R::regret_increment(&s, reward, expected);
+                    let split = if R::FLOORS_REGRET {
+                        split.max(0.0)
+                    } else {
+                        split
+                    };
+                    assert!(
+                        (exact - split).abs() <= 1e-6 * exact.abs().max(1.0),
+                        "{name} t={t} old={old}: exact {exact} vs split {split}"
+                    );
+                }
+            }
+        }
+        check::<Dcfr>("Dcfr", &DiscountParams::RECOMMENDED);
+        check::<DcfrPlus>("DcfrPlus", &DcfrPlus::RECOMMENDED);
+        check::<LinearCfr>("LinearCfr", &());
+        check::<PcfrPlus>("PcfrPlus", &());
+        check::<PdcfrPlus>("PdcfrPlus", &PdcfrPlus::RECOMMENDED);
     }
 }

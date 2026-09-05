@@ -65,6 +65,14 @@
 //! The memory layout is a third type parameter (`F32Full` by default). Swap it
 //! to cut footprint without changing the API:
 //!
+//! | Layout | Regret | Average strategy | Bytes per cell |
+//! |--------|--------|------------------|----------------|
+//! | [`F32Full`] (default) | f32 | f32 sum | 8 |
+//! | [`Int32Full`] | i32 fixed-point | f32 sum | 8 |
+//! | [`HalfStrategyShared`] | f32 | u16 average, shared weight | 6 |
+//! | [`Int32HalfShared`] | i32 fixed-point | u16 average, shared weight | 6 |
+//! | [`Int32NoAverage`] | i32 fixed-point | none | 4 |
+//!
 //! ```
 //! use little_sorry::{BatchedMatcher, Dcfr, DiscountParams, Local, HalfStrategy};
 //! // f32 regret + u16 average strategy — ~25% smaller, same f32-facing API.
@@ -73,6 +81,31 @@
 //! let mut probs = [0.0; 3];
 //! node.average_into(0, &mut probs);
 //! assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+//! ```
+//!
+//! The int32 lanes keep a constant regret quantum at any magnitude (f32 stops
+//! absorbing small increments past ~10⁶) and carry an optional floor for
+//! regret-based pruning; pruned actions are skipped with the masked update
+//! entry points:
+//!
+//! ```
+//! use little_sorry::{
+//!     BatchedMatcher, Dcfr, DiscountParams, Int32Config, Int32NoAverage, Local, Scratch,
+//!     dominated_regret_after,
+//! };
+//!
+//! let params = DiscountParams::RECOMMENDED;
+//! // A floor derived from the rule: 5× where a dominated action sits after 200 ticks.
+//! let floor = 5.0 * dominated_regret_after::<Dcfr>(&params, 200, 1.0);
+//! let node = BatchedMatcher::<Dcfr, Local, Int32NoAverage>::with_regret_config(
+//!     8, 3, params, Int32Config { scale: 100.0, floor },
+//! );
+//! assert_eq!(node.regret_floor(), Some(floor));
+//!
+//! let mut scratch = Scratch::new(3);
+//! let mut expected = [0.0; 8];
+//! // Action 2 was not traversed this tick: its regret is left exactly as stored.
+//! node.update_batch_masked_with(&mut scratch, |a, _| [1.0, -0.5, 0.2][a], |a, _| a != 2, &mut expected);
 //! ```
 
 pub mod batched_matcher;
@@ -112,13 +145,14 @@ pub use batched_matcher::{BatchedMatcher, Scratch};
 // Memory layout types.
 pub use lane::{
     F32Full, F32Regret, F32SumStrategy, HalfBoth, HalfBothShared, HalfRegret, HalfStrategy,
-    HalfStrategyShared, Int16Regret, Layout, RegretLane, StrategyLane, U16AvgStrategy,
+    HalfStrategyShared, Int16Regret, Int32Config, Int32Full, Int32HalfShared, Int32NoAverage,
+    Int32Regret, Layout, NoStrategy, RegretLane, StrategyLane, U16AvgStrategy,
     U16AvgStrategyShared,
 };
 pub use quantize::{FixedWidth, dequantize_dist, quantize_dist};
 pub use rules::{Dcfr, DcfrPlus, LinearCfr, PcfrPlus, PdcfrPlus, PlusDiscount};
 pub use storage::{Atomic, Local};
-pub use update_rule::UpdateRule;
+pub use update_rule::{UpdateRule, dominated_regret_after};
 
 // Re-export for backwards compatibility
 pub use cfr_plus::CfrPlusRegretMatcher as RegretMatcher;

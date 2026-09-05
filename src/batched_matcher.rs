@@ -1417,21 +1417,22 @@ mod alloc_tests {
     use crate::storage::Atomic;
     use std::alloc::{GlobalAlloc, Layout as AllocLayout, System};
     use std::cell::Cell;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
         // const-initialized TLS: no lazy allocation inside the allocator.
-        static COUNTING: Cell<bool> = const { Cell::new(false) };
+        // `Some(n)` means this thread is counting; keeping the count itself
+        // thread-local stops two concurrent `allocations_in` calls from
+        // adding to each other's total.
+        static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
     struct CountingAlloc;
 
     fn note_alloc() {
         // try_with: TLS may be unavailable during thread teardown.
-        let _ = COUNTING.try_with(|c| {
-            if c.get() {
-                ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = COUNT.try_with(|c| {
+            if let Some(n) = c.get() {
+                c.set(Some(n + 1));
             }
         });
     }
@@ -1458,12 +1459,9 @@ mod alloc_tests {
     static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
 
     fn allocations_in(f: impl FnOnce()) -> usize {
-        COUNTING.with(|c| c.set(true));
-        let before = ALLOC_COUNT.load(Ordering::Relaxed);
+        COUNT.with(|c| c.set(Some(0)));
         f();
-        let after = ALLOC_COUNT.load(Ordering::Relaxed);
-        COUNTING.with(|c| c.set(false));
-        after - before
+        COUNT.with(|c| c.replace(None)).unwrap_or(0)
     }
 
     #[test]

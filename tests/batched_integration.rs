@@ -2,8 +2,9 @@
 //! the strategy-export round trip, both exercised through the public API.
 
 use little_sorry::{
-    Atomic, BatchedMatcher, Dcfr, DcfrPlus, DiscountParams, LinearCfr, Local, PcfrPlus, PdcfrPlus,
-    PlusDiscount, UpdateRule, dequantize_dist, quantize_dist,
+    Atomic, BatchedMatcher, Dcfr, DcfrPlus, DiscountParams, Int32Config, Int32Full, LinearCfr,
+    Local, PcfrPlus, PdcfrPlus, PlusDiscount, Scratch, UpdateRule, dequantize_dist,
+    dominated_regret_after, quantize_dist,
 };
 use std::sync::Arc;
 use std::thread;
@@ -141,4 +142,75 @@ fn matchers_of_one_rule_with_different_params_coexist() {
     );
     assert_near_uniform(&aggressive, 0.05);
     assert_near_uniform(&gentle, 0.05);
+}
+
+/// Regret-based pruning end to end: RPS with a fourth, dominated action that
+/// always loses. Once its regret falls below the rule-derived threshold the
+/// caller stops traversing it (masking it out of the update), with a full
+/// traversal every 100 ticks so a pruned action can un-prune. The average
+/// strategy over the three real actions must still reach the RPS equilibrium,
+/// and the dominated action's regret must sit at the configured floor — never
+/// below it, never NaN.
+#[test]
+fn masked_updates_converge_when_pruning_dominated_action() {
+    let params = DiscountParams::RECOMMENDED;
+    // Under DCFR (β = 0) a dominated action's regret approaches the value
+    // `dominated_regret_after` reports from above and never crosses it, so
+    // both the prune threshold and the floor sit a little inside that
+    // asymptote: prune at 90% of it, floor at 95%.
+    let asymptote = dominated_regret_after::<Dcfr>(&params, 200, 1.0);
+    let prune_below = 0.9 * asymptote;
+    let floor = 0.95 * asymptote;
+    assert!(asymptote < 0.0 && floor < prune_below);
+
+    let scale = 100.0f32;
+    let m = BatchedMatcher::<Dcfr, Local, Int32Full>::with_regret_config(
+        1,
+        4,
+        params,
+        Int32Config { scale, floor },
+    );
+    let floor = m.regret_floor().unwrap(); // as the lane represents it
+
+    let mut scratch = Scratch::new(4);
+    let mut current = [0.0f32; 4];
+    let mut regret = [0.0f32; 4];
+    let mut pruned_ticks = 0usize;
+    for t in 1..=20_000usize {
+        m.current_into(0, &mut current);
+        // Opponent plays the real three actions with the row's own current
+        // strategy renormalised over them; "always lose" pays −1 regardless.
+        let real: f32 = current[..3].iter().sum();
+        let opp: Vec<f32> = current[..3].iter().map(|p| p / real.max(1e-9)).collect();
+        let reward = rps_reward(&opp);
+        m.regret_into(0, &mut regret);
+        let prune = t % 100 != 0 && regret[3] < prune_below;
+        pruned_ticks += usize::from(prune);
+        m.update_row_masked_with(
+            &mut scratch,
+            0,
+            |a| if a < 3 { reward[a] } else { -1.0 },
+            |a| a < 3 || !prune,
+        );
+    }
+    assert!(
+        pruned_ticks > 19_000,
+        "pruning barely engaged: {pruned_ticks}"
+    );
+
+    let mut average = [0.0f32; 4];
+    m.average_into(0, &mut average);
+    assert_near_uniform(&average[..3], 0.03);
+    assert!(
+        average[3] < 1e-3,
+        "dominated action in the average: {average:?}"
+    );
+
+    m.regret_into(0, &mut regret);
+    assert!(regret.iter().all(|r| r.is_finite()), "{regret:?}");
+    assert!(
+        (regret[3] - floor).abs() <= 0.5 / scale,
+        "dominated regret {} should sit at the floor {floor}",
+        regret[3]
+    );
 }

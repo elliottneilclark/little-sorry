@@ -21,7 +21,7 @@ mise run fix:clippy         # Auto-fix lint issues
 mise run fix:taplo:format   # Format TOML files
 
 # Run the RPS example binary
-cargo run --release --features rps --bin run_rps
+cargo run --release --features rps --bin run-rps
 
 # Run benchmarks (requires rps feature)
 cargo bench --features rps
@@ -46,6 +46,12 @@ This is a Rust library implementing regret minimization algorithms for game theo
 - **DiscountParams** (`src/discount.rs`): Discount-factor parameters (alpha/beta/gamma) used by the discounted variants.
 
 - **RPSRunnerGeneric** (`src/rps.rs`): Example harness using Rock-Paper-Scissors, generic over any `RegretMinimizer` (`RPSRunner` is the `CfrPlusRegretMatcher` alias). Feature-gated behind `rps`.
+
+- **UpdateRule** (`src/update_rule.rs`) and the rule markers in `src/rules.rs` (`Dcfr`, `DcfrPlus`, `LinearCfr`, `PcfrPlus`, `PdcfrPlus`): the per-algorithm arithmetic the batched matcher is written against. Besides the f32-exact `accumulate_regret`, each rule exposes the same update split as `regret_discount`/`regret_increment` + `FLOORS_REGRET` so integer lanes can accumulate in code space. `dominated_regret_after` simulates a dominated action's regret trajectory for deriving pruning floors.
+
+- **BatchedMatcher** (`src/batched_matcher.rs`): many information sets on one shared clock, generic over rule, `StorageBackend` (`Local`/`Atomic`) and `Layout`. `update_*_with` are the allocation-free hot paths; `update_*_masked_with` are the partial-action variants for regret-based pruning (inactive actions' regret is left untouched). `with_regret_config` threads a lane config (int32 scale/floor); `regret_floor`/`regret_lane` expose it.
+
+- **Lanes and layouts** (`src/lane.rs`): `RegretLane` (`F32Regret`, `Int16Regret`, `Int32Regret` — fixed-point with floor and code-space `accumulate_row`) and `StrategyLane` (`F32SumStrategy`, `U16AvgStrategy[Shared]`,q `NoStrategy` — zero bytes, `HAS_AVERAGE = false`). Layouts pair them: `F32Full`, `Half*`, `Int32Full`, `Int32HalfShared`, `Int32NoAverage`.
 
 ## Key Design Patterns
 

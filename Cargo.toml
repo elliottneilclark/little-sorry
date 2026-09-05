@@ -23,12 +23,12 @@ criterion = "0.8.2"
 
 [[bin]]
 required-features = ["rps"]
-name = "run_rps"
+name = "run-rps"
 path = "src/bin/run_rps.rs"
 
 [[bin]]
 required-features = ["rps"]
-name = "compare_algorithms"
+name = "compare-algorithms"
 path = "src/bin/compare_algorithms.rs"
 
 [[bench]]

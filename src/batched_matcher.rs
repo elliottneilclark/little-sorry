@@ -38,6 +38,8 @@ pub struct Scratch {
     last_inst: Vec<f32>,
     strategy: Vec<f32>,
     reward: Vec<f32>,
+    /// Per-action traversal mask for the masked update paths.
+    active: Vec<bool>,
 }
 
 impl Scratch {
@@ -49,6 +51,7 @@ impl Scratch {
             last_inst: vec![0.0; num_actions],
             strategy: vec![0.0; num_actions],
             reward: vec![0.0; num_actions],
+            active: vec![true; num_actions],
         }
     }
 
@@ -109,13 +112,33 @@ pub struct BatchedMatcher<R: UpdateRule, B: StorageBackend, L: Layout<R, B> = F3
 impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> {
     /// Create a matcher of `num_rows` information sets over `num_actions`
     /// actions. All accumulators start at zero, so every row reads as the
-    /// uniform strategy until updated.
+    /// uniform strategy until updated. The regret lane is built with its
+    /// default [`RegretLane::Config`]; see
+    /// [`with_regret_config`](Self::with_regret_config) to choose one.
     ///
     /// # Panics
     ///
     /// Panics if `num_rows` or `num_actions` is zero.
     #[must_use]
     pub fn new(num_rows: usize, num_actions: usize, params: R::Params) -> Self {
+        Self::with_regret_config(num_rows, num_actions, params, Default::default())
+    }
+
+    /// [`new`](Self::new) with an explicit regret-lane configuration — the
+    /// int32 lanes' scale and floor ([`Int32Config`](crate::lane::Int32Config));
+    /// `()` for the f32 and i16 lanes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_rows` or `num_actions` is zero, or if the lane rejects
+    /// `config`.
+    #[must_use]
+    pub fn with_regret_config(
+        num_rows: usize,
+        num_actions: usize,
+        params: R::Params,
+        config: <L::Regret as RegretLane<B>>::Config,
+    ) -> Self {
         assert!(num_rows > 0, "num_rows must be > 0");
         assert!(num_actions > 0, "num_actions must be > 0");
         let last_inst = if R::LANES > 2 {
@@ -129,7 +152,7 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
             params,
             num_rows,
             num_actions,
-            regret: L::Regret::new(num_rows, num_actions),
+            regret: L::Regret::new(num_rows, num_actions, config),
             strategy: L::Strategy::new(num_rows, num_actions),
             last_inst,
             counter: B::Counter::default(),
@@ -171,6 +194,23 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     #[must_use]
     pub fn num_updates(&self) -> usize {
         self.counter.load()
+    }
+
+    /// The floor the regret lane clamps stored regret to, if it has one
+    /// (`None` for the unbounded f32 and i16 lanes). A pruning caller compares
+    /// against this to know how far below zero a skipped action can sit.
+    #[must_use]
+    pub fn regret_floor(&self) -> Option<f32> {
+        self.regret.floor()
+    }
+
+    /// The regret lane itself, for value-exact checkpoint export — e.g.
+    /// [`Int32Regret::codes_row`](crate::lane::Int32Regret::codes_row), which
+    /// hands out raw codes where [`regret_into`](Self::regret_into) would round
+    /// through f32.
+    #[must_use]
+    pub fn regret_lane(&self) -> &L::Regret {
+        &self.regret
     }
 
     /// Advance the shared clock by one tick and compute the rule's per-iteration
@@ -232,10 +272,121 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
                 s.last_inst[i] = inst;
             }
         }
-        self.regret.write_row(row, a, &s.regret[..a]);
+        // The f32 lanes store the row as computed; wider lanes re-apply the
+        // rule's (discount, increment) split in their own precision.
+        let (regret, reward) = (&mut s.regret[..a], &s.reward[..a]);
+        self.regret.accumulate_row(
+            row,
+            a,
+            regret,
+            |i, old| {
+                Some((
+                    R::regret_discount(step, old),
+                    R::regret_increment(step, reward[i], expected),
+                ))
+            },
+            R::FLOORS_REGRET,
+            self.num_updates(),
+        );
 
         // The strategy this tick plays (and accumulates) is derived from the
         // updated lanes, then folded into the cumulative-strategy lane.
+        R::strategy_from_lanes(
+            &self.params,
+            &s.regret[..a],
+            &s.last_inst[..a],
+            R::post_discount(step),
+            &mut s.strategy[..a],
+        );
+        self.strategy
+            .accumulate(row, a, step, &s.strategy[..a], self.num_updates());
+
+        expected
+    }
+
+    /// [`update_one`](Self::update_one) where only the actions `active` admits
+    /// were traversed this tick. Inactive actions have no reward: their regret
+    /// and `last_inst` cells are left exactly as stored, and the expected value
+    /// is taken over the active set with the pre-update strategy renormalised
+    /// over it. When every action is active this is `update_one` step for
+    /// step, including the exact `dot` for the expected value.
+    fn update_one_masked(
+        &self,
+        row: usize,
+        step: &R::Step,
+        value: impl Fn(usize) -> f32,
+        active: impl Fn(usize) -> bool,
+        s: &mut Scratch,
+    ) -> f32 {
+        debug_assert!(
+            L::Regret::MASK_EXACT,
+            "masked updates are unsupported on this layout: its regret lane \
+             cannot round-trip an inactive action's regret unchanged"
+        );
+        let a = self.num_actions;
+        let predictive = R::LANES > 2;
+
+        self.regret.read_row(row, a, &mut s.regret[..a]);
+        let mut all_active = true;
+        for i in 0..a {
+            if predictive {
+                s.last_inst[i] = self.li_load(row * a + i);
+            }
+            let on = active(i);
+            s.active[i] = on;
+            all_active &= on;
+            // The value accessor is only consulted for traversed actions.
+            s.reward[i] = if on { value(i) } else { 0.0 };
+        }
+
+        // Pre-update strategy over *all* actions: a pruned action with negative
+        // regret already carries zero mass; a positive-regret action the caller
+        // chose not to traverse keeps its mass and is renormalised out of
+        // `expected` only.
+        R::strategy_from_lanes(
+            &self.params,
+            &s.regret[..a],
+            &s.last_inst[..a],
+            R::pre_discount(step),
+            &mut s.strategy[..a],
+        );
+        let expected = if all_active {
+            crate::vector_ops::dot(&s.strategy[..a], &s.reward[..a])
+        } else {
+            masked_expected(&s.strategy[..a], &s.reward[..a], &s.active[..a])
+        };
+
+        for i in 0..a {
+            if !s.active[i] {
+                continue;
+            }
+            s.regret[i] = R::accumulate_regret(step, s.regret[i], s.reward[i], expected);
+            if predictive {
+                let inst = s.reward[i] - expected;
+                self.li_store(row * a + i, inst);
+                s.last_inst[i] = inst;
+            }
+        }
+        // `None` leaves an inactive cell untouched: the f32 lane skips the
+        // store, code-space lanes skip the cell but keep their rounding draw
+        // aligned.
+        let (regret, reward, mask) = (&mut s.regret[..a], &s.reward[..a], &s.active[..a]);
+        self.regret.accumulate_row(
+            row,
+            a,
+            regret,
+            |i, old| {
+                mask[i].then(|| {
+                    (
+                        R::regret_discount(step, old),
+                        R::regret_increment(step, reward[i], expected),
+                    )
+                })
+            },
+            R::FLOORS_REGRET,
+            self.num_updates(),
+        );
+
         R::strategy_from_lanes(
             &self.params,
             &s.regret[..a],
@@ -324,6 +475,78 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
         ev
     }
 
+    /// [`update_row_with`](Self::update_row_with) where `active(action)` says
+    /// whether that action was traversed this tick — the partial update a
+    /// regret-pruning solver needs when it skips an action's subtree and so has
+    /// no reward for it.
+    ///
+    /// Inactive actions keep their stored regret exactly (no discount, no add)
+    /// and, for predictive rules, their last-instantaneous regret; `value` is
+    /// not called for them. The pre-update strategy is still derived from the
+    /// full lanes, and the returned expected value is
+    /// `Σ_active σ(a)·value(a) / Σ_active σ(a)` — the plain mean of the active
+    /// rewards if no active action carries mass, `0.0` if nothing is active.
+    /// The post-update strategy is derived from the full updated lanes and
+    /// accumulated as usual, and the clock advances once. With every action
+    /// active this is [`update_row_with`](Self::update_row_with) bit for bit.
+    ///
+    /// Unsupported on the i16 regret layouts, whose per-row rescale cannot
+    /// leave an inactive cell untouched ([`RegretLane::MASK_EXACT`]); debug
+    /// builds assert this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `row >= num_rows` or `scratch.num_actions() < num_actions`.
+    pub fn update_row_masked_with(
+        &self,
+        scratch: &mut Scratch,
+        row: usize,
+        value: impl Fn(usize) -> f32,
+        active: impl Fn(usize) -> bool,
+    ) -> f32 {
+        assert!(row < self.num_rows, "row out of range");
+        assert!(
+            scratch.num_actions() >= self.num_actions,
+            "scratch too small"
+        );
+        let step = self.tick();
+        let ev = self.update_one_masked(row, &step, value, active, scratch);
+        self.advance_weight(&step);
+        ev
+    }
+
+    /// [`update_batch_with`](Self::update_batch_with) with a per-row action
+    /// mask `active(action, row)`; see
+    /// [`update_row_masked_with`](Self::update_row_masked_with) for the
+    /// semantics of an inactive action.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `expected_out.len() < num_rows` or
+    /// `scratch.num_actions() < num_actions`.
+    pub fn update_batch_masked_with(
+        &self,
+        scratch: &mut Scratch,
+        value: impl Fn(usize, usize) -> f32,
+        active: impl Fn(usize, usize) -> bool,
+        expected_out: &mut [f32],
+    ) {
+        assert!(
+            expected_out.len() >= self.num_rows,
+            "expected_out too short"
+        );
+        assert!(
+            scratch.num_actions() >= self.num_actions,
+            "scratch too small"
+        );
+        let step = self.tick();
+        for (row, ev) in expected_out.iter_mut().enumerate().take(self.num_rows) {
+            *ev =
+                self.update_one_masked(row, &step, |a| value(a, row), |a| active(a, row), scratch);
+        }
+        self.advance_weight(&step);
+    }
+
     /// Zeros the average (cumulative-strategy) lane and its per-row weights;
     /// leaves cumulative regret, current strategy, and the clock untouched.
     /// Pair with `seed` for a clean warm start where the target drives only the
@@ -346,13 +569,14 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     pub fn seed(&self, regret: impl Fn(usize, usize) -> f32, t0: usize) {
         let a = self.num_actions;
         let mut row_buf = vec![0.0f32; a];
+        self.counter.store(t0);
+        let update_count = self.num_updates();
         for row in 0..self.num_rows {
             for (i, slot) in row_buf.iter_mut().enumerate() {
                 *slot = regret(i, row);
             }
-            self.regret.write_row(row, a, &row_buf);
+            self.regret.write_row(row, a, &row_buf, update_count);
         }
-        self.counter.store(t0);
     }
 
     /// Write a row's current strategy (the distribution it would play next) into
@@ -398,8 +622,15 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     ///
     /// # Panics
     ///
-    /// Panics if `row >= num_rows` or `out.len() < num_actions`.
+    /// Panics if `row >= num_rows`, `out.len() < num_actions`, or the layout
+    /// keeps no average lane ([`NoStrategy`](crate::lane::NoStrategy)) — snapshot
+    /// [`current_into`](Self::current_into) instead.
     pub fn average_into(&self, row: usize, out: &mut [f32]) {
+        assert!(
+            L::Strategy::HAS_AVERAGE,
+            "{} keeps no average lane; snapshot `current_into` instead",
+            std::any::type_name::<L>()
+        );
         assert!(row < self.num_rows, "row out of range");
         assert!(out.len() >= self.num_actions, "out too short");
         self.strategy.average_into(row, self.num_actions, out);
@@ -413,7 +644,7 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     /// discards.
     ///
     /// It is exactly the quantity [`seed`](Self::seed) writes, read through the
-    /// same [`RegretLane`](crate::lane::RegretLane), so `read → modify → seed`
+    /// same [`RegretLane`], so `read → modify → seed`
     /// round-trips: bit-exact for the `F32Regret` store, and within one row-scaled
     /// quantum for the `Int16Regret` store (which decodes per-row-scaled i16).
     ///
@@ -452,6 +683,31 @@ impl<R: UpdateRule, B: StorageBackend, L: Layout<R, B>> BatchedMatcher<R, B, L> 
     }
 }
 
+/// Expected value of `reward` under `strategy` restricted to the `active`
+/// actions: `Σ_active σ·r / Σ_active σ`, the plain mean of the active rewards
+/// when the active set carries no mass, and `0.0` when nothing is active.
+fn masked_expected(strategy: &[f32], reward: &[f32], active: &[bool]) -> f32 {
+    let mut weighted = 0.0f32;
+    let mut mass = 0.0f32;
+    let mut plain = 0.0f32;
+    let mut count = 0usize;
+    for ((&s, &r), &on) in strategy.iter().zip(reward).zip(active) {
+        if on {
+            weighted += s * r;
+            mass += s;
+            plain += r;
+            count += 1;
+        }
+    }
+    if mass > 0.0 {
+        weighted / mass
+    } else if count > 0 {
+        plain / count as f32
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 impl<R: UpdateRule, B: StorageBackend> BatchedMatcher<R, B> {
     /// Raw cumulative-regret lane for a row (test-only; the public surface
@@ -479,6 +735,7 @@ mod tests {
     use crate::lane::HalfRegret;
     use crate::rules::{Dcfr, PdcfrPlus};
     use crate::storage::Local;
+    use crate::unit_fixed::RowDraws;
 
     #[test]
     fn fresh_matcher_reads_uniform() {
@@ -862,6 +1119,289 @@ mod tests {
         let mut scratch = Scratch::new(2);
         let mut ev = [0.0f32; 1];
         m.update_batch_with(&mut scratch, |a, _| a as f32, &mut ev);
+    }
+
+    // ── int32 config, no-average layout, masked updates ─────────────────────
+
+    use crate::lane::{Int32Config, Int32Full, Int32NoAverage};
+
+    #[test]
+    #[should_panic(expected = "no average lane")]
+    fn average_into_panics_on_no_average_layout() {
+        let m =
+            BatchedMatcher::<Dcfr, Local, Int32NoAverage>::new(1, 3, DiscountParams::RECOMMENDED);
+        let mut out = [0.0f32; 3];
+        m.average_into(0, &mut out);
+    }
+
+    #[test]
+    fn no_average_layout_updates_and_reads_current() {
+        let m =
+            BatchedMatcher::<Dcfr, Local, Int32NoAverage>::new(2, 3, DiscountParams::RECOMMENDED);
+        let mut ev = [0.0f32; 2];
+        for _ in 0..50 {
+            m.update_batch(|a, _| [1.0, -0.5, 0.2][a], &mut ev);
+        }
+        m.reset_average(); // no-op, must not panic
+        let mut cur = [0.0f32; 3];
+        m.current_into(1, &mut cur);
+        assert!(cur[0] > 0.9, "action 0 dominates: {cur:?}");
+        assert!((cur.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert_eq!(m.num_updates(), 50);
+    }
+
+    #[test]
+    fn with_regret_config_threads_floor() {
+        let cfg = Int32Config {
+            scale: 100.0,
+            floor: -7.5,
+        };
+        let m = BatchedMatcher::<Dcfr, Local, Int32Full>::with_regret_config(
+            1,
+            3,
+            DiscountParams::RECOMMENDED,
+            cfg,
+        );
+        assert_eq!(m.regret_floor(), Some(-7.5));
+        assert_eq!(m.regret_lane().scale(), 100.0);
+        // Seeding below the floor clamps; the lane reports it through regret_into.
+        m.seed(|a, _| [-100.0, 0.0, 3.0][a], 0);
+        let mut r = [0.0f32; 3];
+        m.regret_into(0, &mut r);
+        assert_eq!(r, [-7.5, 0.0, 3.0]);
+
+        let f = BatchedMatcher::<Dcfr, Local>::new(1, 3, DiscountParams::RECOMMENDED);
+        assert_eq!(f.regret_floor(), None);
+        let d = BatchedMatcher::<Dcfr, Local, Int32Full>::new(1, 3, DiscountParams::RECOMMENDED);
+        assert_eq!(d.regret_floor(), Some(i32::MIN as f32 / 100.0));
+    }
+
+    #[test]
+    fn int32_average_uses_stored_regret() {
+        let t = (1..)
+            .find(|&t| RowDraws::new(0, t).next_u01() > 0.5)
+            .expect("row draws include a value above one half");
+        let increment = RowDraws::new(0, t).next_u01() * 0.5;
+        let m = BatchedMatcher::<Dcfr, Local, Int32Full>::with_regret_config(
+            1,
+            2,
+            DiscountParams::RECOMMENDED,
+            Int32Config {
+                scale: 1.0,
+                ..Int32Config::default()
+            },
+        );
+        m.seed(|_, _| 0.0, t - 1);
+        m.update_row(0, |a| if a == 0 { 2.0 * increment } else { 0.0 });
+
+        let mut current = [0.0f32; 2];
+        m.current_into(0, &mut current);
+        assert_eq!(current, [0.5, 0.5], "stored regrets have no positive code");
+
+        let mut average = [0.0f32; 2];
+        m.average_into(0, &mut average);
+        assert_eq!(
+            average, current,
+            "average must use the stored regret strategy"
+        );
+    }
+
+    #[test]
+    fn int32_full_tracks_f32_full_on_the_golden_stream() {
+        // Same reward stream through F32Full and Int32Full: cumulative regret
+        // agrees to within the accumulated rounding (a random walk of ≤ 1
+        // quantum per tick) and the average strategy agrees closely.
+        let params = DiscountParams::RECOMMENDED;
+        let f = BatchedMatcher::<Dcfr, Local>::new(1, 4, params);
+        let q = BatchedMatcher::<Dcfr, Local, Int32Full>::new(1, 4, params);
+        let mut state = 0x5555_aaaa_1234_5678u64;
+        let ticks = 300;
+        for _ in 0..ticks {
+            let rewards: Vec<f32> = (0..4).map(|_| next_reward(&mut state)).collect();
+            f.update_row(0, |a| rewards[a]);
+            q.update_row(0, |a| rewards[a]);
+        }
+        let (mut rf, mut rq) = ([0.0f32; 4], [0.0f32; 4]);
+        f.regret_into(0, &mut rf);
+        q.regret_into(0, &mut rq);
+        for a in 0..4 {
+            assert!(
+                (rf[a] - rq[a]).abs() < 0.01 * (ticks as f32).sqrt() * 3.0,
+                "regret[{a}] {} vs {}",
+                rf[a],
+                rq[a]
+            );
+        }
+        let (mut af, mut aq) = ([0.0f32; 4], [0.0f32; 4]);
+        f.average_into(0, &mut af);
+        q.average_into(0, &mut aq);
+        for a in 0..4 {
+            assert!(
+                (af[a] - aq[a]).abs() < 1e-2,
+                "average[{a}] {} vs {}",
+                af[a],
+                aq[a]
+            );
+        }
+    }
+
+    #[test]
+    fn masked_update_leaves_inactive_regret_untouched() {
+        fn run<L: Layout<Dcfr, Local>>(
+            masked: &BatchedMatcher<Dcfr, Local, L>,
+            ev_tol: f32,
+        ) -> (BatchedMatcher<Dcfr, Local, L>, Vec<f32>) {
+            // Action 2 is masked out for the whole run; its seed is negative so
+            // it carries no mass, making the other three a pure 3-action game.
+            let seed = [0.5f32, -0.25, -5.0, 0.75];
+            masked.seed(|a, _| seed[a], 0);
+            let sub = BatchedMatcher::<Dcfr, Local, L>::new(1, 3, DiscountParams::RECOMMENDED);
+            sub.seed(|a, _| [seed[0], seed[1], seed[3]][a], 0);
+            let mut scratch = Scratch::new(4);
+            let mut state = 0xdead_beef_0000_1111u64;
+            for _ in 0..100 {
+                let r: Vec<f32> = (0..4).map(|_| next_reward(&mut state)).collect();
+                let ev_m = masked.update_row_masked_with(&mut scratch, 0, |a| r[a], |a| a != 2);
+                let ev_s = sub.update_row_with(&mut scratch, 0, |a| [r[0], r[1], r[3]][a]);
+                assert!((ev_m - ev_s).abs() < ev_tol, "expected {ev_m} vs {ev_s}");
+            }
+            let mut out = vec![0.0f32; 4];
+            masked.regret_into(0, &mut out);
+            (sub, out)
+        }
+
+        // F32Full: inactive cell bit-identical to its seed; others match the
+        // subgame to the tolerance of the renormalised expected value.
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 4, DiscountParams::RECOMMENDED);
+        let (sub, out) = run(&m, 1e-5);
+        assert_eq!(out[2].to_bits(), (-5.0f32).to_bits());
+        let mut sub_r = [0.0f32; 3];
+        sub.regret_into(0, &mut sub_r);
+        for (i, sub_i) in [0usize, 1, 3].into_iter().enumerate() {
+            assert!(
+                (out[sub_i] - sub_r[i]).abs() < 1e-4 * sub_r[i].abs().max(1.0),
+                "action {sub_i}: {} vs subgame {}",
+                out[sub_i],
+                sub_r[i]
+            );
+        }
+
+        // Int32Full: inactive cell code-identical to its seed code; the others
+        // track the subgame within the rounding random walk (the two matchers
+        // draw different stochastic-rounding slots for the same action, so
+        // per-tick expected values agree only to the 0.01 quantum's effect).
+        let m = BatchedMatcher::<Dcfr, Local, Int32Full>::new(1, 4, DiscountParams::RECOMMENDED);
+        let mut seed_code = [0i32; 4];
+        m.seed(|a, _| [0.5, -0.25, -5.0, 0.75][a], 0);
+        m.regret_lane().codes_row(0, 4, &mut seed_code);
+        let (sub, out) = run(&m, 5e-2);
+        let mut codes = [0i32; 4];
+        m.regret_lane().codes_row(0, 4, &mut codes);
+        assert_eq!(codes[2], seed_code[2]);
+        assert_eq!(codes[2], -500);
+        sub.regret_into(0, &mut sub_r);
+        for (i, sub_i) in [0usize, 1, 3].into_iter().enumerate() {
+            assert!(
+                (out[sub_i] - sub_r[i]).abs() < 0.5,
+                "action {sub_i}: {} vs subgame {}",
+                out[sub_i],
+                sub_r[i]
+            );
+        }
+    }
+
+    #[test]
+    fn masked_expected_renormalises_over_active() {
+        let mut scratch = Scratch::new(4);
+        // σ = [0.75, 0.25, 0, 0]; action 1 masked ⇒ expected = 0.75·2 / 0.75.
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 4, DiscountParams::RECOMMENDED);
+        m.seed(|a, _| [3.0, 1.0, 0.0, 0.0][a], 0);
+        let ev =
+            m.update_row_masked_with(&mut scratch, 0, |a| [2.0, 100.0, 4.0, 6.0][a], |a| a != 1);
+        assert!((ev - 2.0).abs() < 1e-6, "{ev}");
+
+        // No active action carries mass ⇒ plain mean of the active rewards.
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 4, DiscountParams::RECOMMENDED);
+        m.seed(|a, _| [3.0, 1.0, -1.0, -1.0][a], 0);
+        let ev =
+            m.update_row_masked_with(&mut scratch, 0, |a| [2.0, 100.0, 4.0, 6.0][a], |a| a >= 2);
+        assert!((ev - 5.0).abs() < 1e-6, "{ev}");
+
+        // Nothing active: 0.0, the clock still advances, nothing is written.
+        let ev = m.update_row_masked_with(&mut scratch, 0, |_| unreachable!(), |_| false);
+        assert_eq!(ev, 0.0);
+        assert_eq!(m.num_updates(), 2);
+        let mut r = [0.0f32; 4];
+        m.regret_into(0, &mut r);
+        assert_eq!(r[0], 3.0, "never active: seed kept ({r:?})");
+        assert_eq!(r[1], 1.0, "never active: seed kept ({r:?})");
+        assert!(
+            r[2] < -1.0 && r[3] > 0.0,
+            "active once, then untouched: {r:?}"
+        );
+
+        // The value accessor is never consulted for an inactive action.
+        let m = BatchedMatcher::<Dcfr, Local>::new(1, 4, DiscountParams::RECOMMENDED);
+        m.update_row_masked_with(
+            &mut scratch,
+            0,
+            |a| {
+                assert_ne!(a, 3, "value called for masked action");
+                1.0
+            },
+            |a| a != 3,
+        );
+
+        // Batch form: per-row masks and rewards.
+        let m = BatchedMatcher::<Dcfr, Local>::new(2, 4, DiscountParams::RECOMMENDED);
+        m.seed(|a, _| [3.0, 1.0, 0.0, 0.0][a], 0);
+        let mut ev = [0.0f32; 2];
+        m.update_batch_masked_with(
+            &mut scratch,
+            |a, _| [2.0, 100.0, 4.0, 6.0][a],
+            |a, row| if row == 0 { a != 1 } else { a != 0 },
+            &mut ev,
+        );
+        assert!((ev[0] - 2.0).abs() < 1e-6, "{ev:?}");
+        assert!((ev[1] - 100.0).abs() < 1e-6, "{ev:?}");
+        assert_eq!(m.num_updates(), 1);
+    }
+
+    #[test]
+    fn masked_update_is_identity_when_all_active() {
+        fn check<R: UpdateRule>(params: R::Params) {
+            let a = BatchedMatcher::<R, Local>::new(1, 4, params.clone());
+            let b = BatchedMatcher::<R, Local>::new(1, 4, params);
+            a.seed(|i, _| [0.5, 0.0, 0.25, 0.1][i], 3);
+            b.seed(|i, _| [0.5, 0.0, 0.25, 0.1][i], 3);
+            let mut scratch = Scratch::new(4);
+            let mut state = 0x0bad_cafe_f00d_1234u64;
+            for _ in 0..100 {
+                let r: Vec<f32> = (0..4).map(|_| next_reward(&mut state)).collect();
+                let ev_a = a.update_row_with(&mut scratch, 0, |i| r[i]);
+                let ev_b = b.update_row_masked_with(&mut scratch, 0, |i| r[i], |_| true);
+                assert_eq!(ev_a.to_bits(), ev_b.to_bits(), "expected values diverged");
+                assert_bits("regret", &b.raw_regret(0), &a.raw_regret(0));
+                assert_bits("strategy", &b.raw_strategy(0), &a.raw_strategy(0));
+            }
+            let (mut ca, mut cb) = ([0.0f32; 4], [0.0f32; 4]);
+            a.current_into(0, &mut ca);
+            b.current_into(0, &mut cb);
+            assert_bits("current", &cb, &ca);
+        }
+        check::<Dcfr>(DiscountParams::RECOMMENDED);
+        check::<PdcfrPlus>(PdcfrPlus::RECOMMENDED); // exercises the last_inst lane
+    }
+
+    #[test]
+    fn masked_update_keeps_last_inst_for_inactive() {
+        let m = BatchedMatcher::<PdcfrPlus, Local>::new(1, 3, PdcfrPlus::RECOMMENDED);
+        let mut scratch = Scratch::new(3);
+        m.update_row_with(&mut scratch, 0, |a| [1.0, -1.0, 0.5][a]);
+        let before = m.li_load(2);
+        m.update_row_masked_with(&mut scratch, 0, |a| [0.3, 0.9, 0.0][a], |a| a != 2);
+        assert_eq!(m.li_load(2).to_bits(), before.to_bits());
+        assert_ne!(m.li_load(0).to_bits(), before.to_bits());
     }
 }
 

@@ -9,7 +9,8 @@
 //! depends on, plus `Send`/`Sync` assertions for every layout.
 
 use little_sorry::lane::{
-    F32Full, HalfBoth, HalfBothShared, HalfStrategy, HalfStrategyShared, Layout,
+    F32Full, HalfBoth, HalfBothShared, HalfStrategy, HalfStrategyShared, Int32Full,
+    Int32HalfShared, Int32NoAverage, Layout,
 };
 use little_sorry::{Atomic, BatchedMatcher, Dcfr, DiscountParams};
 
@@ -22,6 +23,13 @@ fn atomic_half_layouts_are_send_sync() {
     assert_send_sync::<BatchedMatcher<Dcfr, Atomic, HalfStrategyShared>>();
     assert_send_sync::<BatchedMatcher<Dcfr, Atomic, HalfBoth>>();
     assert_send_sync::<BatchedMatcher<Dcfr, Atomic, HalfBothShared>>();
+}
+
+#[test]
+fn int32_layouts_are_send_sync() {
+    assert_send_sync::<BatchedMatcher<Dcfr, Atomic, Int32Full>>();
+    assert_send_sync::<BatchedMatcher<Dcfr, Atomic, Int32HalfShared>>();
+    assert_send_sync::<BatchedMatcher<Dcfr, Atomic, Int32NoAverage>>();
 }
 
 /// rs-poker's DCFR discount parameters.
@@ -44,18 +52,31 @@ const PAYOFFS: [[f32; 3]; 8] = [
     [0.3, -0.4, 0.0],
 ];
 
+/// Rows whose payoff ties two actions (`PAYOFFS[2]`: actions 0 and 1 both pay
+/// 0.4). On such a row the instantaneous regret of the tied pair is exactly
+/// zero once the row sits on the tie, so f32 stays frozen at an exact 50/50
+/// while the int32 lane's stochastic rounding random-walks along the flat
+/// direction of that non-unique equilibrium — an arbitrary split of the tied
+/// pair, not a lane error. The int32 comparisons skip these rows; every other
+/// row matches f32 exactly under both `Local` and 8-thread `Atomic` runs.
+fn is_tied_row(row: usize) -> bool {
+    row % PAYOFFS.len() == 2
+}
+
 fn reward(action: usize, row: usize) -> f32 {
     PAYOFFS[row % PAYOFFS.len()][action]
 }
 
 /// Spawn `threads` workers, all sharing one `Arc<BatchedMatcher<…, Atomic, L>>`,
 /// each advancing every row `iters_per_thread` ticks with the stationary
-/// `reward`. Returns the per-row average strategy (rows × actions).
+/// `reward`. Returns the per-row average strategy (rows × actions), or the
+/// current strategy when `current` (for layouts with no average lane).
 fn solve_concurrent<L>(
     threads: usize,
     iters_per_thread: usize,
     rows: usize,
     params: DiscountParams,
+    current: bool,
 ) -> Vec<Vec<f32>>
 where
     L: Layout<Dcfr, Atomic>,
@@ -80,10 +101,39 @@ where
     (0..rows)
         .map(|row| {
             let mut out = vec![0.0f32; 3];
-            m.average_into(row, &mut out);
+            if current {
+                m.current_into(row, &mut out);
+            } else {
+                m.average_into(row, &mut out);
+            }
             out
         })
         .collect()
+}
+
+/// Assert every component of `got` is within `tol` of `baseline` on `rows`,
+/// printing the worst gap.
+fn assert_rows_match(
+    name: &str,
+    rows: impl Iterator<Item = usize>,
+    got: &[Vec<f32>],
+    baseline: &[Vec<f32>],
+    tol: f32,
+) {
+    let mut max_gap = 0.0f32;
+    for row in rows {
+        for a in 0..3 {
+            let gap = (got[row][a] - baseline[row][a]).abs();
+            max_gap = max_gap.max(gap);
+            assert!(
+                gap <= tol,
+                "{name}: row {row} action {a} gap {gap} exceeds {tol} (got={}, f32={})",
+                got[row][a],
+                baseline[row][a],
+            );
+        }
+    }
+    eprintln!("{name}: max per-component gap vs f32 = {max_gap}");
 }
 
 #[test]
@@ -99,41 +149,81 @@ fn half_layouts_match_f32_under_concurrency() {
     const TOL: f32 = 5e-2;
 
     let params = rs_poker_params();
-    let baseline = solve_concurrent::<F32Full>(THREADS, ITERS, ROWS, params);
+    let baseline = solve_concurrent::<F32Full>(THREADS, ITERS, ROWS, params, false);
 
-    let check = |name: &str, avg: &[Vec<f32>]| {
-        let mut max_gap = 0.0f32;
-        for row in 0..ROWS {
-            for a in 0..3 {
-                let gap = (avg[row][a] - baseline[row][a]).abs();
-                max_gap = max_gap.max(gap);
-                assert!(
-                    gap <= TOL,
-                    "{name}: row {row} action {a} gap {gap} exceeds {TOL} \
-                     (half={}, f32={})",
-                    avg[row][a],
-                    baseline[row][a],
-                );
-            }
-        }
-        eprintln!("{name}: max per-component gap vs f32 = {max_gap}");
-    };
-
-    check(
+    assert_rows_match(
         "HalfStrategy",
-        &solve_concurrent::<HalfStrategy>(THREADS, ITERS, ROWS, params),
+        0..ROWS,
+        &solve_concurrent::<HalfStrategy>(THREADS, ITERS, ROWS, params, false),
+        &baseline,
+        TOL,
     );
-    check(
+    assert_rows_match(
         "HalfStrategyShared",
-        &solve_concurrent::<HalfStrategyShared>(THREADS, ITERS, ROWS, params),
+        0..ROWS,
+        &solve_concurrent::<HalfStrategyShared>(THREADS, ITERS, ROWS, params, false),
+        &baseline,
+        TOL,
     );
-    check(
+    assert_rows_match(
         "HalfBoth",
-        &solve_concurrent::<HalfBoth>(THREADS, ITERS, ROWS, params),
+        0..ROWS,
+        &solve_concurrent::<HalfBoth>(THREADS, ITERS, ROWS, params, false),
+        &baseline,
+        TOL,
     );
-    check(
+    assert_rows_match(
         "HalfBothShared",
-        &solve_concurrent::<HalfBothShared>(THREADS, ITERS, ROWS, params),
+        0..ROWS,
+        &solve_concurrent::<HalfBothShared>(THREADS, ITERS, ROWS, params, false),
+        &baseline,
+        TOL,
+    );
+}
+
+#[test]
+fn int32_layouts_match_f32_under_concurrency() {
+    const THREADS: usize = 8;
+    const ITERS: usize = 4_000;
+    const ROWS: usize = 16;
+    const TOL: f32 = 5e-2;
+
+    let params = rs_poker_params();
+    let baseline = solve_concurrent::<F32Full>(THREADS, ITERS, ROWS, params, false);
+    assert_rows_match(
+        "Int32Full",
+        (0..ROWS).filter(|&r| !is_tied_row(r)),
+        &solve_concurrent::<Int32Full>(THREADS, ITERS, ROWS, params, false),
+        &baseline,
+        TOL,
+    );
+    assert_rows_match(
+        "Int32HalfShared",
+        (0..ROWS).filter(|&r| !is_tied_row(r)),
+        &solve_concurrent::<Int32HalfShared>(THREADS, ITERS, ROWS, params, false),
+        &baseline,
+        TOL,
+    );
+}
+
+/// `Int32NoAverage` has no average to compare, so its concurrent check is on
+/// the current strategy every row settles to under the stationary payoffs.
+#[test]
+fn int32_no_average_matches_f32_current_under_concurrency() {
+    const THREADS: usize = 8;
+    const ITERS: usize = 4_000;
+    const ROWS: usize = 16;
+    const TOL: f32 = 5e-2;
+
+    let params = rs_poker_params();
+    let baseline = solve_concurrent::<F32Full>(THREADS, ITERS, ROWS, params, true);
+    let got = solve_concurrent::<Int32NoAverage>(THREADS, ITERS, ROWS, params, true);
+    assert_rows_match(
+        "Int32NoAverage",
+        (0..ROWS).filter(|&r| !is_tied_row(r)),
+        &got,
+        &baseline,
+        TOL,
     );
 }
 
@@ -230,39 +320,59 @@ fn half_layouts_match_f32_under_concurrency_nonstationary() {
     let params = rs_poker_params();
     let baseline = solve_concurrent_nonstationary::<F32Full>(THREADS, ITERS, ROWS, PERIOD, params);
 
-    let check = |name: &str, avg: &[Vec<f32>]| {
-        let mut max_gap = 0.0f32;
-        for row in 0..ROWS {
-            for a in 0..3 {
-                let gap = (avg[row][a] - baseline[row][a]).abs();
-                max_gap = max_gap.max(gap);
-                assert!(
-                    gap <= TOL,
-                    "{name}: row {row} action {a} gap {gap} exceeds {TOL} \
-                     (half={}, f32={})",
-                    avg[row][a],
-                    baseline[row][a],
-                );
-            }
-        }
-        eprintln!("{name} (non-stationary): max per-component gap vs f32 = {max_gap}");
-    };
-
-    check(
-        "HalfStrategy",
+    assert_rows_match(
+        "HalfStrategy (non-stationary)",
+        0..ROWS,
         &solve_concurrent_nonstationary::<HalfStrategy>(THREADS, ITERS, ROWS, PERIOD, params),
+        &baseline,
+        TOL,
     );
-    check(
-        "HalfStrategyShared",
+    assert_rows_match(
+        "HalfStrategyShared (non-stationary)",
+        0..ROWS,
         &solve_concurrent_nonstationary::<HalfStrategyShared>(THREADS, ITERS, ROWS, PERIOD, params),
+        &baseline,
+        TOL,
     );
-    check(
-        "HalfBoth",
+    assert_rows_match(
+        "HalfBoth (non-stationary)",
+        0..ROWS,
         &solve_concurrent_nonstationary::<HalfBoth>(THREADS, ITERS, ROWS, PERIOD, params),
+        &baseline,
+        TOL,
     );
-    check(
-        "HalfBothShared",
+    assert_rows_match(
+        "HalfBothShared (non-stationary)",
+        0..ROWS,
         &solve_concurrent_nonstationary::<HalfBothShared>(THREADS, ITERS, ROWS, PERIOD, params),
+        &baseline,
+        TOL,
+    );
+}
+
+#[test]
+fn int32_layouts_match_f32_under_concurrency_nonstationary() {
+    const THREADS: usize = 8;
+    const ITERS: usize = 4_000;
+    const ROWS: usize = 16;
+    const PERIOD: usize = ITERS / 4;
+    const TOL: f32 = 5e-2;
+
+    let params = rs_poker_params();
+    let baseline = solve_concurrent_nonstationary::<F32Full>(THREADS, ITERS, ROWS, PERIOD, params);
+    assert_rows_match(
+        "Int32Full (non-stationary)",
+        (0..ROWS).filter(|&r| !is_tied_row(r)),
+        &solve_concurrent_nonstationary::<Int32Full>(THREADS, ITERS, ROWS, PERIOD, params),
+        &baseline,
+        TOL,
+    );
+    assert_rows_match(
+        "Int32HalfShared (non-stationary)",
+        (0..ROWS).filter(|&r| !is_tied_row(r)),
+        &solve_concurrent_nonstationary::<Int32HalfShared>(THREADS, ITERS, ROWS, PERIOD, params),
+        &baseline,
+        TOL,
     );
 }
 
